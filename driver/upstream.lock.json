@@ -1,0 +1,9 @@
+{
+  "name": "Microsoft Windows Driver Samples - SysVAD",
+  "repository": "https://github.com/microsoft/Windows-driver-samples.git",
+  "commit": "717778a20ba4dd2440fe609f69153a1f8a64f597",
+  "subtree": "audio/sysvad",
+  "license": "MS-PL",
+  "patch": "patches/0001-church-stream-virtual-cable.patch",
+  "patchSha256": "2744d0c8cd9b814de2ea4ce10d2a76e46797abd5a5eba1f21607e67c23aa0b9b"
+}
