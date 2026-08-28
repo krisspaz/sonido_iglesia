@@ -1,6 +1,7 @@
 #include "Audio/AudioRouting.h"
 #include "Audio/MeterSource.h"
 #include "Analysis/AnalysisEngine.h"
+#include "Analysis/Psychoacoustics.h"
 #include "DSP/ProcessingEngine.h"
 #include "Smart/SmartEngine.h"
 #include "Offline/OfflineProcessor.h"
@@ -398,20 +399,61 @@ CSP_TEST_CASE void testSafetyControllerAndSmartMasking()
     expect(rollbackRequested,
            "Safety Controller must rollback sustained excessive processing");
 
+    namespace psy = churchstream::psychoacoustics;
     churchstream::SmartMaskingController masking;
     churchstream::GroupFeatures voice, music;
     voice.rmsDb = -18.0f;
     voice.voiceProbability = 0.95f;
-    voice.bandEnergy = { 0.02f, 0.08f, 0.62f, 0.25f, 0.03f };
+    voice.bandLevelDb.fill(-30.0f);
+
+    const auto settle = [&](const churchstream::GroupFeatures& v,
+                            const churchstream::GroupFeatures& m) {
+        masking.reset();
+        churchstream::MaskingDecision result;
+        for (int update = 0; update < 60; ++update)
+            result = masking.update(v, m, 0.1f);
+        return result;
+    };
+
+    // Music well below the voice: intelligibility is intact and nothing may be
+    // touched, however loud the music happens to be overall.
     music.rmsDb = -15.0f;
-    music.bandEnergy = { 0.08f, 0.12f, 0.55f, 0.22f, 0.03f };
-    churchstream::MaskingDecision decision;
-    for (int update = 0; update < 40; ++update)
-        decision = masking.update(voice, music, 0.1f);
-    expect(decision.active && decision.musicGainDb[2] < -0.05f,
-           "Smart Masking must reduce only overlapping music presence when voice is active");
-    expect(std::abs(decision.musicGainDb[0]) < 1.0e-5f,
-           "Smart Masking must preserve unrelated low-frequency music energy");
+    music.bandLevelDb.fill(-55.0f);
+    auto decision = settle(voice, music);
+    expect(decision.speechIntelligibility > 0.95f,
+           "a voice clear of the music must score a high SII");
+    expect(!decision.active,
+           "Smart Masking must do nothing while the preaching is already intelligible");
+
+    // Music over the voice across the consonant range: the SII collapses and
+    // the music must give way.
+    music.bandLevelDb.fill(-20.0f);
+    decision = settle(voice, music);
+    expect(decision.speechIntelligibility < 0.45f,
+           "music above the voice must be measured as destroying intelligibility");
+    expect(decision.active, "Smart Masking must engage once the SII falls below target");
+    for (const auto gainDb : decision.musicGainDb)
+        expect(gainDb <= 0.0f && gainDb >= -churchstream::SmartMaskingController::maximumReductionDb,
+               "masking may only reduce, and only within its limit");
+
+    // The case that decides whether the model is doing anything a simple
+    // per-band ducker could not. Music sits only at 1.6-1.85 kHz, in the
+    // second application zone. The voice it buries is at 2.5-2.9 kHz, three
+    // Bark higher, in the third zone -- masked entirely by upward spreading.
+    // The reduction must land on the music that is doing the masking, in zone
+    // 1. Attenuating zone 3, where the masked voice is, would remove music
+    // that is not there and leave the masker untouched.
+    voice.bandLevelDb.fill(-100.0f);
+    voice.bandLevelDb[13] = voice.bandLevelDb[14] = -30.0f;
+    music.bandLevelDb.fill(-100.0f);
+    music.bandLevelDb[10] = music.bandLevelDb[11] = 10.0f;
+    decision = settle(voice, music);
+    expect(decision.speechIntelligibility < 0.75f,
+           "a masker three Bark below the voice must still be measured as masking it");
+    expect(decision.musicGainDb[1] < decision.musicGainDb[2] - 0.5f,
+           "the reduction must land on the band doing the masking, not the band being masked");
+    expect(decision.musicGainDb[1] < -0.5f,
+           "the masking band must actually be reduced");
 }
 
 CSP_TEST_CASE void testAutomaticMultigroupRouting()
@@ -693,6 +735,334 @@ float blockRmsDb(const juce::AudioBuffer<float>& buffer, int start, int count)
                       + static_cast<double>(buffer.getSample(1, sample)) * buffer.getSample(1, sample));
     const auto rms = std::sqrt(sum / std::max(1, count));
     return rms > 1.0e-9 ? static_cast<float>(20.0 * std::log10(rms)) : -100.0f;
+}
+
+CSP_TEST_CASE void testPsychoacousticModels()
+{
+    namespace psy = churchstream::psychoacoustics;
+
+    // Zwicker's scale against its published anchors.
+    expect(approximately(psy::barkFromHertz(0.0f), 0.0f, 1.0e-4f), "0 Hz must be 0 Bark");
+    expect(approximately(psy::barkFromHertz(1000.0f), 8.51f, 0.02f),
+           "1 kHz must land at 8.5 Bark");
+    expect(psy::barkFromHertz(4000.0f) > 17.0f && psy::barkFromHertz(4000.0f) < 18.5f,
+           "4 kHz must land near 17.9 Bark");
+    // Monotonic and compressive: an octave is worth fewer Bark the higher it is.
+    expect(psy::barkFromHertz(2000.0f) - psy::barkFromHertz(1000.0f)
+               > psy::barkFromHertz(8000.0f) - psy::barkFromHertz(4000.0f),
+           "the Bark scale must compress towards high frequencies");
+    expect(approximately(psy::hertzFromBark(psy::barkFromHertz(2500.0f)), 2500.0f, 1.0f),
+           "the Bark inversion must round-trip");
+
+    // Schroeder's spreading function peaks on the masker and is asymmetric.
+    expect(approximately(psy::spreadingDb(0.0f), 0.0f, 0.05f),
+           "a masker must mask its own band at roughly 0 dB");
+    expect(psy::spreadingDb(1.0f) > psy::spreadingDb(-1.0f),
+           "masking must reach further upwards in frequency than downwards");
+    expect(psy::spreadingDb(4.0f) < -20.0f && psy::spreadingDb(-4.0f) < -30.0f,
+           "masking must decay away from the masker on both sides");
+
+    // A single loud band must project a threshold onto its neighbours that
+    // falls off, rather than covering the whole spectrum equally.
+    std::array<float, psy::criticalBandCount> masker {};
+    masker.fill(-120.0f);
+    masker[7] = 0.0f;  // 1 kHz
+    std::array<float, psy::criticalBandCount> threshold {};
+    psy::maskingThresholdDb(masker, threshold);
+    expect(approximately(threshold[7], 0.0f, 0.5f),
+           "the masking threshold at the masker must be the masker's own level");
+    expect(threshold[8] > threshold[10] && threshold[10] > threshold[13],
+           "the projected threshold must fall with distance from the masker");
+    expect(threshold[13] < -20.0f,
+           "a 1 kHz masker must not be masking 2.5 kHz at full strength");
+
+    // SII endpoints. The weights sum to one, so a fully audible voice is 1.0.
+    std::array<float, psy::criticalBandCount> speech {};
+    std::array<float, psy::criticalBandCount> noise {};
+    speech.fill(0.0f);
+    noise.fill(-40.0f);
+    expect(approximately(psy::speechIntelligibilityIndex(speech, noise), 1.0f, 1.0e-3f),
+           "speech far above the masker must score a full SII");
+    noise.fill(40.0f);
+    expect(approximately(psy::speechIntelligibilityIndex(speech, noise), 0.0f, 1.0e-3f),
+           "speech buried under the masker must score zero");
+    noise.fill(0.0f);
+    expect(approximately(psy::speechIntelligibilityIndex(speech, noise), 0.5f, 1.0e-3f),
+           "speech level with the masker must sit at the middle of the audibility ramp");
+
+    // Losing the 1-4 kHz consonant region must cost far more than losing the
+    // same number of bands at the edges. That weighting is the whole point of
+    // using the standard's importance function instead of flat bands.
+    noise.fill(-40.0f);
+    auto edges = noise;
+    edges[0] = edges[1] = edges[19] = edges[20] = 40.0f;
+    const auto edgeLoss = 1.0f - psy::speechIntelligibilityIndex(speech, edges);
+    auto consonants = noise;
+    consonants[13] = consonants[14] = consonants[15] = consonants[16] = 40.0f;
+    const auto consonantLoss = 1.0f - psy::speechIntelligibilityIndex(speech, consonants);
+    expect(consonantLoss > edgeLoss * 2.0f,
+           "masking the consonant bands must cost far more intelligibility than masking the edges");
+}
+
+CSP_TEST_CASE void testMonoCompatibilityCollapsesLowSide()
+{
+    constexpr int sampleRate = 48000;
+    constexpr int blockSize = 256;
+    auto enginePointer = std::make_unique<churchstream::ProcessingEngine>();
+    auto& engine = *enginePointer;
+    engine.prepare(sampleRate, blockSize, 2);
+    auto& parameters = engine.getParameters();
+    parameters.smartProcessing.store(false);
+    parameters.rumbleEnabled.store(false);
+    parameters.adaptiveEqEnabled.store(false);
+    parameters.compressorEnabled.store(false);
+    parameters.saturationEnabled.store(false);
+    parameters.limiterEnabled.store(false);
+    parameters.monoCompatibilityEnabled.store(true);
+    parameters.phaseCoherenceEnabled.store(false);
+
+    // Renders either a pure Side signal (L = -R) or a pure Mid signal (L = R)
+    // at one frequency, and reports how much Side and Mid survive the chain.
+    const auto measure = [&](float frequency, bool sideSignal, float& sideRms, float& midRms) {
+        engine.reset();
+        std::vector<float> left(blockSize), right(blockSize);
+        float* channels[] { left.data(), right.data() };
+        auto phase = 0.0;
+        const auto step = 2.0 * juce::MathConstants<double>::pi * frequency / sampleRate;
+        double sideSquares = 0.0, midSquares = 0.0;
+        auto counted = 0;
+        for (int block = 0; block < 400; ++block)
+        {
+            for (int sample = 0; sample < blockSize; ++sample)
+            {
+                const auto value = 0.25f * static_cast<float>(std::sin(phase));
+                left[static_cast<size_t>(sample)] = value;
+                right[static_cast<size_t>(sample)] = sideSignal ? -value : value;
+                phase += step;
+            }
+            engine.process(channels, 2, blockSize);
+            if (block < 200) continue;
+            for (int sample = 0; sample < blockSize; ++sample)
+            {
+                const auto side = 0.5 * (left[static_cast<size_t>(sample)] - right[static_cast<size_t>(sample)]);
+                const auto mid = 0.5 * (left[static_cast<size_t>(sample)] + right[static_cast<size_t>(sample)]);
+                sideSquares += side * side;
+                midSquares += mid * mid;
+                ++counted;
+            }
+        }
+        sideRms = static_cast<float>(std::sqrt(sideSquares / std::max(counted, 1)));
+        midRms = static_cast<float>(std::sqrt(midSquares / std::max(counted, 1)));
+    };
+
+    // A 0.25 peak sine carries 0.1768 RMS into whichever of Mid or Side it is
+    // placed in.
+    constexpr auto sourceRms = 0.25f * 0.70710678f;
+    float sideRms = 0.0f, midRms = 0.0f;
+
+    // 50 Hz Side is what cancels on a phone speaker, and it is the one thing
+    // that must not survive.
+    measure(50.0f, true, sideRms, midRms);
+    expect(sideRms < sourceRms * 0.15f,
+           "low-frequency Side must be collapsed towards mono");
+
+    // The same signal well above the corner must be left alone, otherwise this
+    // is not a bass-mono filter, it is a width control.
+    measure(5000.0f, true, sideRms, midRms);
+    expect(sideRms > sourceRms * 0.98f,
+           "high-frequency Side must pass untouched");
+
+    // Mid is the mono sum, and it must not pay for the collapsed Side. The
+    // reference is measured with the feature off rather than assumed: the DC
+    // blocker is a 38 Hz high-pass and already costs 2 dB at 50 Hz.
+    measure(50.0f, false, sideRms, midRms);
+    const auto monoCompatibleMidRms = midRms;
+    expect(sideRms < 1.0e-4f, "a mono input must stay mono");
+    parameters.monoCompatibilityEnabled.store(false);
+    measure(50.0f, false, sideRms, midRms);
+    expect(monoCompatibleMidRms > midRms * 0.99f,
+           "low-frequency Mid must be preserved: bass mono moves energy, it does not remove it");
+}
+
+CSP_TEST_CASE void testPhaseCoherenceNarrowsOnlyIncoherentProgramme()
+{
+    constexpr int sampleRate = 48000;
+    constexpr int blockSize = 256;
+    auto enginePointer = std::make_unique<churchstream::ProcessingEngine>();
+    auto& engine = *enginePointer;
+    auto& parameters = engine.getParameters();
+    auto& metrics = engine.getMetrics();
+
+    const auto render = [&](bool antiPhase) {
+        engine.prepare(sampleRate, blockSize, 2);
+        parameters.smartProcessing.store(false);
+        parameters.rumbleEnabled.store(false);
+        parameters.adaptiveEqEnabled.store(false);
+        parameters.compressorEnabled.store(false);
+        parameters.saturationEnabled.store(false);
+        parameters.limiterEnabled.store(false);
+        parameters.monoCompatibilityEnabled.store(false);
+        parameters.phaseCoherenceEnabled.store(true);
+        std::vector<float> left(blockSize), right(blockSize);
+        float* channels[] { left.data(), right.data() };
+        auto phase = 0.0;
+        const auto step = 2.0 * juce::MathConstants<double>::pi * 900.0 / sampleRate;
+        for (int block = 0; block < 3000; ++block)
+        {
+            for (int sample = 0; sample < blockSize; ++sample)
+            {
+                const auto value = 0.25f * static_cast<float>(std::sin(phase));
+                left[static_cast<size_t>(sample)] = value;
+                right[static_cast<size_t>(sample)] = antiPhase ? -value : value;
+                phase += step;
+            }
+            engine.process(channels, 2, blockSize);
+        }
+    };
+
+    render(false);
+    expect(metrics.programmeCorrelation.load() > 0.95f,
+           "an in-phase programme must measure as correlated");
+    expect(metrics.appliedStereoWidth.load() > 0.99f,
+           "a coherent programme must keep its full width");
+
+    render(true);
+    expect(metrics.programmeCorrelation.load() < -0.95f,
+           "an anti-phase programme must measure as uncorrelated");
+    expect(metrics.appliedStereoWidth.load() < 0.60f,
+           "an incoherent programme must have its Side pulled in before it reaches a mono speaker");
+}
+
+CSP_TEST_CASE void testLevelerTracksSectionsWithoutPumping()
+{
+    constexpr int sampleRate = 48000;
+    constexpr int blockSize = 256;
+    auto enginePointer = std::make_unique<churchstream::ProcessingEngine>();
+    auto& engine = *enginePointer;
+    engine.prepare(sampleRate, blockSize, 2);
+    auto& parameters = engine.getParameters();
+    auto& metrics = engine.getMetrics();
+    parameters.smartProcessing.store(false);
+    parameters.rumbleEnabled.store(false);
+    parameters.adaptiveEqEnabled.store(false);
+    parameters.compressorEnabled.store(false);
+    parameters.saturationEnabled.store(false);
+    parameters.limiterEnabled.store(false);
+    parameters.broadcastLevelerEnabled.store(true);
+
+    std::vector<float> left(blockSize), right(blockSize);
+    float* channels[] { left.data(), right.data() };
+    auto phase = 0.0;
+    const auto step = 2.0 * juce::MathConstants<double>::pi * 700.0 / sampleRate;
+    auto envelopePhase = 0.0;
+    const auto envelopeStep = 2.0 * juce::MathConstants<double>::pi * 3.0 / sampleRate;
+
+    // `syllables` adds +/-6 dB of 3 Hz amplitude movement, which is roughly how
+    // much a speaking voice moves without the section having changed at all.
+    const auto run = [&](float levelDb, bool syllables, int blocks,
+                         float& minGainDb, float& maxGainDb, int settleBlocks) {
+        minGainDb = 1.0e9f;
+        maxGainDb = -1.0e9f;
+        const auto base = std::pow(10.0f, levelDb / 20.0f);
+        for (int block = 0; block < blocks; ++block)
+        {
+            for (int sample = 0; sample < blockSize; ++sample)
+            {
+                auto amplitude = base;
+                if (syllables)
+                {
+                    amplitude *= std::pow(10.0f, 6.0f * static_cast<float>(std::sin(envelopePhase)) / 20.0f);
+                    envelopePhase += envelopeStep;
+                }
+                const auto value = amplitude * static_cast<float>(std::sin(phase));
+                left[static_cast<size_t>(sample)] = value;
+                right[static_cast<size_t>(sample)] = value;
+                phase += step;
+            }
+            engine.process(channels, 2, blockSize);
+            if (block < settleBlocks) continue;
+            const auto gainDb = metrics.broadcastLevelGainDb.load();
+            minGainDb = std::min(minGainDb, gainDb);
+            maxGainDb = std::max(maxGainDb, gainDb);
+        }
+    };
+
+    // Both levels are chosen so the required gain stays inside the -10/+15 dB
+    // recovery range. Outside it the clamp hides how fast the estimate moved,
+    // and the test would pass with any smoother at all.
+    float minGainDb = 0.0f, maxGainDb = 0.0f;
+
+    // A steady speaking voice: the gain must sit still. A fixed fast smoother
+    // rides the syllables here, which is exactly the pumping complaint.
+    run(-13.0f, true, 4000, minGainDb, maxGainDb, 2000);
+    expect(maxGainDb - minGainDb < 1.5f,
+           "the leveler must not ride syllable-rate movement inside one section");
+    const auto steadyGainDb = 0.5f * (minGainDb + maxGainDb);
+
+    // Worship ends, prayer begins: 12 dB down in one step. The gate spends
+    // 2.5 s deciding this is a section and not a pause, which leaves about a
+    // second to cover the 12 dB. A filter locked at the slow time constant
+    // gets less than half way in that time; raising the process noise once the
+    // innovation persists is what makes the difference.
+    run(-25.0f, true, 700, minGainDb, maxGainDb, 699);
+    const auto afterSectionChangeDb = metrics.broadcastLevelGainDb.load();
+    expect(afterSectionChangeDb - steadyGainDb > 9.0f,
+           "a real section change must be tracked within about a second of being recognised");
+}
+
+CSP_TEST_CASE void testLevelerGateIgnoresPauses()
+{
+    constexpr int sampleRate = 48000;
+    constexpr int blockSize = 256;
+    auto enginePointer = std::make_unique<churchstream::ProcessingEngine>();
+    auto& engine = *enginePointer;
+    engine.prepare(sampleRate, blockSize, 2);
+    auto& parameters = engine.getParameters();
+    auto& metrics = engine.getMetrics();
+    parameters.smartProcessing.store(false);
+    parameters.rumbleEnabled.store(false);
+    parameters.adaptiveEqEnabled.store(false);
+    parameters.compressorEnabled.store(false);
+    parameters.saturationEnabled.store(false);
+    parameters.limiterEnabled.store(false);
+    parameters.broadcastLevelerEnabled.store(true);
+
+    std::vector<float> left(blockSize), right(blockSize);
+    float* channels[] { left.data(), right.data() };
+    auto phase = 0.0;
+    const auto step = 2.0 * juce::MathConstants<double>::pi * 700.0 / sampleRate;
+
+    const auto run = [&](float levelDb, int blocks) {
+        const auto amplitude = std::pow(10.0f, levelDb / 20.0f);
+        for (int block = 0; block < blocks; ++block)
+        {
+            for (int sample = 0; sample < blockSize; ++sample)
+            {
+                const auto value = amplitude * static_cast<float>(std::sin(phase));
+                left[static_cast<size_t>(sample)] = value;
+                right[static_cast<size_t>(sample)] = value;
+                phase += step;
+            }
+            engine.process(channels, 2, blockSize);
+        }
+    };
+
+    run(-26.0f, 4000);
+    expect(metrics.levelerGateOpen.load(), "programme must hold the gate open");
+    const auto programmeGainDb = metrics.broadcastLevelGainDb.load();
+
+    // A pause: not silence, just room tone 25 dB below the programme. This is
+    // air conditioning and microphone hiss, and it must not be levelled up.
+    run(-51.0f, 800);
+    expect(!metrics.levelerGateOpen.load(),
+           "room tone well below the programme must close the relative gate");
+    // Not zero: the gate integrates over 400 ms to avoid chattering on
+    // syllables, and the estimate keeps moving at its slow time constant until
+    // the gate closes. That costs about 2.5 dB of drift at the start of a
+    // pause, after which the leveler is frozen. Chasing the last of it would
+    // mean gating faster, which brings the chattering back.
+    expect(metrics.broadcastLevelGainDb.load() < programmeGainDb + 3.0f,
+           "a closed gate must freeze the leveler instead of amplifying room tone");
 }
 
 CSP_TEST_CASE void testTruePeakDetectorFindsIntersamplePeaks()
@@ -1398,14 +1768,14 @@ CSP_TEST_CASE void testGroupMixerFallbackAndMasking()
     const auto decision = mixer->getDecision();
     expect(decision.active && decision.applied,
            "music covering the voice presence range must engage Smart Masking once enabled");
-    expect(decision.musicGainDb[2] <= 0.0f && decision.musicGainDb[3] <= 0.0f,
-           "masking may only reduce, never boost");
-    expect(decision.musicGainDb[2] >= -2.5f && decision.musicGainDb[3] >= -2.5f,
-           "masking must respect its 2.5 dB limit");
-    expect(approximately(decision.musicGainDb[0], 0.0f, 1.0e-4f)
-           && approximately(decision.musicGainDb[4], 0.0f, 1.0e-4f),
-           "masking must leave the low and high bands of the music alone");
-
+    expect(decision.speechIntelligibility < 1.0f,
+           "the mixer must report the intelligibility it measured, not a default");
+    for (const auto gainDb : decision.musicGainDb)
+    {
+        expect(gainDb <= 0.0f, "masking may only reduce, never boost");
+        expect(gainDb >= -churchstream::SmartMaskingController::maximumReductionDb,
+               "masking must respect its reduction limit");
+    }
 }
 
 CSP_TEST_CASE void testRoomCalibrationMeasuresDecayAndResonance()
@@ -1486,6 +1856,11 @@ int main()
     testEqDynamicEqAndCompressorBehaviour();
     testOfflineFileProcessing();
     testBroadcastLevelerStabilisesStereoProgramme();
+    testPsychoacousticModels();
+    testMonoCompatibilityCollapsesLowSide();
+    testPhaseCoherenceNarrowsOnlyIncoherentProgramme();
+    testLevelerTracksSectionsWithoutPumping();
+    testLevelerGateIgnoresPauses();
     testTruePeakDetectorFindsIntersamplePeaks();
     testLimiterStaysUnderTruePeakCeiling();
     testWatchdogFailsafeAndInputSanitising();

@@ -45,8 +45,8 @@ public:
 private:
     struct BandAnalyser
     {
-        std::array<Biquad, 5> filters;
-        std::array<double, 5> energy {};
+        std::array<Biquad, psychoacoustics::criticalBandCount> filters;
+        std::array<double, psychoacoustics::criticalBandCount> energy {};
         double totalSquares = 0.0;
 
         void configure(double sampleRate) noexcept;
@@ -62,15 +62,15 @@ private:
     BandAnalyser voiceAnalyser;
     BandAnalyser musicAnalyser;
     SmartMaskingController masking;
-    std::array<Biquad, 2> musicMaskFilters;
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> presenceGain;
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> upperGain;
+    std::array<Biquad, maskingZoneCount> musicMaskFilters;
+    std::array<juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear>, maskingZoneCount> zoneGain;
 
     MaskingDecision decision;
     // The audio callback owns decision. The UI reads a lock-free published
     // snapshot, so diagnostics can never stall the real-time path.
-    std::array<std::atomic<float>, 5> publishedMusicGainDb;
+    std::array<std::atomic<float>, maskingZoneCount> publishedMusicGainDb;
     std::atomic<float> publishedConfidence { 0.0f };
+    std::atomic<float> publishedIntelligibility { 1.0f };
     std::atomic<unsigned char> publishedFlags { 0U };
     std::atomic<std::uint32_t> publishedVersion { 0U };
 };

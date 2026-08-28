@@ -823,11 +823,19 @@ void MainComponent::updateLiveValues()
 
     const auto masking = audioEngine.getMaskingDecision();
     if (masking.active)
+    {
+        // The zone gains are what happened; the SII is why. Showing the reason
+        // is what lets an operator decide whether to trust it.
+        juce::String zones;
+        for (int zone = 0; zone < maskingZoneCount; ++zone)
+            zones += (zone > 0 ? ", " : "")
+                + juce::String(static_cast<int>(maskingZoneCentresHz[static_cast<size_t>(zone)]))
+                + " Hz " + juce::String(masking.musicGainDb[static_cast<size_t>(zone)], 1) + " dB";
         actions += juce::String(actions.isEmpty() ? "" : "\n")
             + (masking.applied ? "MASKING | " : "MASKING (advisory) | ")
-            + "music presence " + juce::String(masking.musicGainDb[2], 1) + " dB, upper "
-            + juce::String(masking.musicGainDb[3], 1) + " dB | " + percentText(masking.confidence)
-            + " confidence";
+            + "SII " + juce::String(masking.speechIntelligibility, 2) + " | " + zones
+            + " | " + percentText(masking.confidence) + " confidence";
+    }
     const auto programmeGainDb = dspMetrics.broadcastLevelGainDb.load(std::memory_order_acquire);
     if (std::abs(programmeGainDb) >= 0.2f)
         actions += juce::String(actions.isEmpty() ? "" : "\n") + "BROADCAST LEVEL | "

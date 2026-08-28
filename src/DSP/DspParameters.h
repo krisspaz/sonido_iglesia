@@ -81,6 +81,10 @@ struct DspMetrics final
     // engine actually applied after coherence safety.
     std::atomic<float> programmeCorrelation { 1.0f };
     std::atomic<float> appliedStereoWidth { 1.0f };
+    // Kalman estimate of programme level, and whether the leveler gate is open.
+    // A closed gate means the leveler is deliberately doing nothing.
+    std::atomic<float> programmeLevelDb { -100.0f };
+    std::atomic<bool> levelerGateOpen { false };
     // DSP watchdog. A non-finite or divergent sample must never reach a live
     // stream, so the engine crossfades to the dry safety path instead. These
     // are reported so the operator and the SafetyController can see that the
