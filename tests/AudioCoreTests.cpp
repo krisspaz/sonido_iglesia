@@ -21,6 +21,7 @@
 #include <functional>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -559,6 +560,55 @@ CSP_TEST_CASE void testEqDynamicEqAndCompressorBehaviour()
            "4-band compressor must report gain reduction from real processing");
 }
 
+CSP_TEST_CASE void testBroadcastLevelerStabilisesStereoProgramme()
+{
+    constexpr int sampleRate = 48000;
+    constexpr int blockSize = 256;
+    churchstream::ProcessingEngine engine;
+    engine.prepare(sampleRate, blockSize, 2);
+    auto& parameters = engine.getParameters();
+    parameters.smartProcessing.store(false);
+    parameters.rumbleEnabled.store(false);
+    parameters.adaptiveEqEnabled.store(false);
+    parameters.compressorEnabled.store(false);
+    parameters.saturationEnabled.store(false);
+    parameters.limiterEnabled.store(false);
+    parameters.broadcastLevelerEnabled.store(true);
+
+    std::vector<float> left(blockSize), right(blockSize);
+    float* channels[] { left.data(), right.data() };
+    auto phase = 0.0;
+    const auto step = 2.0 * juce::MathConstants<double>::pi * 1300.0 / sampleRate;
+    double quietSquares = 0.0;
+    for (int block = 0; block < 2200; ++block)
+    {
+        for (int sample = 0; sample < blockSize; ++sample)
+        {
+            const auto value = 0.010f * static_cast<float>(std::sin(phase));
+            left[static_cast<size_t>(sample)] = value;
+            right[static_cast<size_t>(sample)] = value;
+            phase += step;
+        }
+        engine.process(channels, 2, blockSize);
+        if (block >= 2100)
+            for (const auto value : left) quietSquares += static_cast<double>(value) * value;
+    }
+    const auto quietRms = static_cast<float>(std::sqrt(quietSquares / (100.0 * blockSize)));
+    expect(engine.getMetrics().broadcastLevelGainDb.load() > 12.0f,
+           "Broadcast leveler must recover a consistently quiet stereo programme within its +15 dB limit");
+    expect(quietRms > 0.030f,
+           "Broadcast leveler must audibly raise the quiet programme rather than only reporting it");
+
+    for (int block = 0; block < 1000; ++block)
+    {
+        std::fill(left.begin(), left.end(), 0.0f);
+        std::fill(right.begin(), right.end(), 0.0f);
+        engine.process(channels, 2, blockSize);
+    }
+    expect(std::abs(engine.getMetrics().broadcastLevelGainDb.load()) < 0.5f,
+           "Broadcast leveler must return to unity during extended silence instead of preparing to raise room noise");
+}
+
 CSP_TEST_CASE void testOfflineFileProcessing()
 {
     constexpr int sampleRate = 48000;
@@ -780,6 +830,120 @@ CSP_TEST_CASE void renderAbComparison(bool matchEnabled, float& processedRmsDb, 
     renderSeconds(processedRmsDb);
     parameters.abProcessed.store(false);
     renderSeconds(alternativeRmsDb);
+}
+
+CSP_TEST_CASE void testWatchdogFailsafeAndInputSanitising()
+{
+    constexpr int sampleRate = 48000;
+    constexpr int blockSize = 256;
+    auto enginePointer = std::make_unique<churchstream::ProcessingEngine>();
+    auto& engine = *enginePointer;
+    engine.prepare(sampleRate, blockSize, 2);
+    auto& parameters = engine.getParameters();
+    auto& metrics = engine.getMetrics();
+    parameters.smartProcessing.store(false);
+    parameters.operatingMode.store(static_cast<int>(churchstream::OperatingMode::manual));
+
+    juce::AudioBuffer<float> buffer(2, blockSize);
+    int phase = 0;
+    auto worstOutput = 0.0f;
+    auto allFinite = true;
+
+    // Renders `blocks` blocks of a steady tone and returns the output RMS in dB,
+    // ignoring the first `skip` blocks so smoothed gains have settled.
+    const auto render = [&](int blocks, int skip) {
+        auto square = 0.0;
+        auto counted = 0;
+        for (int block = 0; block < blocks; ++block)
+        {
+            for (int sample = 0; sample < blockSize; ++sample)
+            {
+                const auto value = 0.3f * std::sin(juce::MathConstants<float>::twoPi
+                                                   * 220.0f * static_cast<float>(phase++) / sampleRate);
+                buffer.setSample(0, sample, value);
+                buffer.setSample(1, sample, value);
+            }
+            float* channels[] { buffer.getWritePointer(0), buffer.getWritePointer(1) };
+            engine.process(channels, 2, blockSize);
+            for (int channel = 0; channel < 2; ++channel)
+            {
+                for (int sample = 0; sample < blockSize; ++sample)
+                {
+                    const auto out = buffer.getSample(channel, sample);
+                    allFinite = allFinite && std::isfinite(out);
+                    worstOutput = std::max(worstOutput, std::isfinite(out) ? std::abs(out) : 1.0e9f);
+                    if (block >= skip)
+                    {
+                        square += static_cast<double>(out) * out;
+                        ++counted;
+                    }
+                }
+            }
+        }
+        return counted > 0
+            ? static_cast<float>(10.0 * std::log10(std::max(square / counted, 1.0e-12)))
+            : -100.0f;
+    };
+
+    const auto referenceRmsDb = render(40, 20);
+    expect(!metrics.failsafeActive.load(), "the watchdog must stay out of the way on healthy audio");
+    expect(metrics.failsafeEngagements.load() == 0u,
+           "healthy programme must never be counted as a DSP fault");
+
+    // The panic switch must reach the dry path without silence and without a
+    // fault being reported, then hand the processed path back.
+    parameters.forceFailsafe.store(true);
+    const auto forcedRmsDb = render(20, 5);
+    expect(metrics.failsafeActive.load(), "a forced failsafe must engage the dry safety path");
+    expect(metrics.failsafeEngagements.load() == 0u,
+           "an operator-forced failsafe is not a DSP fault and must not be counted as one");
+    // The tone is 0.3 peak, so the untouched dry path sits at -13.5 dBFS RMS.
+    expect(std::abs(forcedRmsDb + 13.5f) < 1.0f,
+           "the failsafe path must carry the dry signal, not silence or a gain-matched copy");
+
+    parameters.forceFailsafe.store(false);
+    const auto recoveredRmsDb = render(120, 100);
+    expect(!metrics.failsafeActive.load(), "the engine must return to the processed path when released");
+    expect(std::abs(recoveredRmsDb - referenceRmsDb) < 1.0f,
+           "the processed path must sound the same after a failsafe as before it");
+
+    // Broken samples from the driver: NaN, infinities and an absurd magnitude.
+    for (int block = 0; block < 4; ++block)
+    {
+        for (int sample = 0; sample < blockSize; ++sample)
+        {
+            const auto value = 0.3f * std::sin(juce::MathConstants<float>::twoPi
+                                               * 220.0f * static_cast<float>(phase++) / sampleRate);
+            buffer.setSample(0, sample, value);
+            buffer.setSample(1, sample, value);
+        }
+        buffer.setSample(0, 10, std::numeric_limits<float>::quiet_NaN());
+        buffer.setSample(1, 11, std::numeric_limits<float>::infinity());
+        buffer.setSample(0, 12, -std::numeric_limits<float>::infinity());
+        buffer.setSample(1, 13, 1.0e30f);
+        float* channels[] { buffer.getWritePointer(0), buffer.getWritePointer(1) };
+        engine.process(channels, 2, blockSize);
+        for (int channel = 0; channel < 2; ++channel)
+        {
+            for (int sample = 0; sample < blockSize; ++sample)
+            {
+                const auto out = buffer.getSample(channel, sample);
+                allFinite = allFinite && std::isfinite(out);
+                worstOutput = std::max(worstOutput, std::isfinite(out) ? std::abs(out) : 1.0e9f);
+            }
+        }
+    }
+    expect(metrics.nonFiniteInputSamples.load() >= 3u,
+           "non-finite input samples must be counted so the fault is attributed upstream");
+
+    // The real test of the watchdog is not the glitch block itself but what
+    // comes after it: a poisoned recursive state would keep the output dead or
+    // broken long after the input recovered.
+    const auto afterFaultRmsDb = render(120, 100);
+    expect(allFinite, "no non-finite sample may ever reach the output");
+    expect(worstOutput < 5.0f, "the engine must never emit an absurd magnitude");
+    expect(std::abs(afterFaultRmsDb - referenceRmsDb) < 1.0f,
+           "broken input samples must not poison the filter state permanently");
 }
 
 CSP_TEST_CASE void testLoudnessMatchedAb()
@@ -1321,8 +1485,10 @@ int main()
     testAutomaticMultigroupRouting();
     testEqDynamicEqAndCompressorBehaviour();
     testOfflineFileProcessing();
+    testBroadcastLevelerStabilisesStereoProgramme();
     testTruePeakDetectorFindsIntersamplePeaks();
     testLimiterStaysUnderTruePeakCeiling();
+    testWatchdogFailsafeAndInputSanitising();
     testLoudnessMatchedAb();
     testSibilanceDeEsser();
     testOfflineSmartSimulationAndMatchedRender();

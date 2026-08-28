@@ -275,6 +275,7 @@ MainComponent::MainComponent(bool startAudio)
         menu.addItem(4, "Harmonic enhancer", true, parameters.saturationEnabled.load());
         menu.addItem(5, protectLimiter ? "True-peak limiter (LIVE SAFE)" : "True-peak limiter",
                      !protectLimiter, parameters.limiterEnabled.load());
+        menu.addItem(6, "Broadcast programme leveller", true, parameters.broadcastLevelerEnabled.load());
         juce::PopupMenu scenes;
         const auto selectedScene = static_cast<SmartScene>(static_cast<int>(settings.getNumber("smartScene", 0.0)));
         for (int scene = 0; scene <= static_cast<int>(SmartScene::ambience); ++scene)
@@ -313,6 +314,7 @@ MainComponent::MainComponent(bool startAudio)
             else if (selected == 3) toggle(p.compressorEnabled, "compressorEnabled");
             else if (selected == 4) toggle(p.saturationEnabled, "saturationEnabled");
             else if (selected == 5 && !liveRoutingLocked()) toggle(p.limiterEnabled, "limiterEnabled");
+            else if (selected == 6) toggle(p.broadcastLevelerEnabled, "broadcastLevelerEnabled");
             else if (selected == 200)
             {
                 const auto enabled = !audioEngine.isSmartMaskingEnabled();
@@ -569,6 +571,9 @@ void MainComponent::timerCallback()
         safetyInput.analysisDrops = analysis.droppedOutputSamples;
         safetyInput.compressorReductionDb = dsp.compressorGainReductionDb.load(std::memory_order_relaxed);
         safetyInput.limiterReductionDb = dsp.limiterGainReductionDb.load(std::memory_order_relaxed);
+        safetyInput.dspFailsafeActive = dsp.failsafeActive.load(std::memory_order_relaxed);
+        safetyInput.dspFailsafeEngagements = dsp.failsafeEngagements.load(std::memory_order_relaxed);
+        safetyInput.nonFiniteInputSamples = dsp.nonFiniteInputSamples.load(std::memory_order_relaxed);
         safetyInput.analysis = analysis;
         const auto safety = safetyController.evaluate(safetyInput, elapsedSafety);
         if (safety.forceLimiter)
@@ -823,6 +828,11 @@ void MainComponent::updateLiveValues()
             + "music presence " + juce::String(masking.musicGainDb[2], 1) + " dB, upper "
             + juce::String(masking.musicGainDb[3], 1) + " dB | " + percentText(masking.confidence)
             + " confidence";
+    const auto programmeGainDb = dspMetrics.broadcastLevelGainDb.load(std::memory_order_acquire);
+    if (std::abs(programmeGainDb) >= 0.2f)
+        actions += juce::String(actions.isEmpty() ? "" : "\n") + "BROADCAST LEVEL | "
+            + juce::String(programmeGainDb >= 0.0f ? "+" : "")
+            + juce::String(programmeGainDb, 1) + " dB toward stream target";
 
     actionsLabel.setText(actions.trimEnd(), juce::dontSendNotification);
     if (smart.autoTuneState == AutoTuneState::analysing)
@@ -896,6 +906,8 @@ void MainComponent::updateDspControls()
     parameters.compressorEnabled.store(settings.getNumber("compressorEnabled", 1.0) > 0.5, std::memory_order_release);
     parameters.saturationEnabled.store(settings.getNumber("saturationEnabled", 1.0) > 0.5, std::memory_order_release);
     parameters.limiterEnabled.store(settings.getNumber("limiterEnabled", 1.0) > 0.5, std::memory_order_release);
+    parameters.broadcastLevelerEnabled.store(settings.getNumber("broadcastLevelerEnabled", 1.0) > 0.5,
+                                              std::memory_order_release);
     presetSelector.onChange = [this]
     {
         const auto selected = presetSelector.getSelectedItemIndex();

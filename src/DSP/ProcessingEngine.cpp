@@ -11,6 +11,27 @@ namespace
 // ceiling despite release interpolation and floating-point filter tolerance.
 constexpr float limiterCeiling = 0.88104887f;
 
+// Watchdog thresholds. Real programme stays far below both: the limiter holds
+// -1 dBTP and the saturator is bounded, so +18 dBFS on the processed path can
+// only mean a diverging filter. The input clamp keeps +12 dBFS of headroom
+// over anything a console can legitimately send, and exists so an absurd
+// sample cannot be handed straight to the dry safety path either.
+constexpr float failsafeMagnitude = 8.0f;
+constexpr float inputMagnitudeClamp = 4.0f;
+constexpr double failsafeCrossfadeSeconds = 0.010;
+// Long enough that a filter which keeps diverging cannot chatter in and out of
+// the safety path, short enough that a one-off glitch does not cost a phrase.
+constexpr double failsafeHoldSeconds = 0.500;
+
+// Stereo coherence. Below `coherenceOnsetCorrelation` the pair starts losing
+// energy when a phone sums it to mono, so the Side channel is pulled in
+// proportionally rather than at a single threshold: a hard switch would be
+// audible as the image snapping shut mid-song.
+constexpr double correlationIntegrationSeconds = 0.400;
+constexpr float coherenceOnsetCorrelation = 0.30f;
+constexpr float coherenceWorstCorrelation = -0.20f;
+constexpr float coherenceMinimumWidth = 0.55f;
+
 float decibelsToGain(float decibels) noexcept
 {
     return std::pow(10.0f, decibels / 20.0f);
@@ -56,6 +77,10 @@ void ProcessingEngine::prepare(double newSampleRate, int maximumBlockSize, int c
     loudnessMatchCoefficient = std::exp(-1.0f / static_cast<float>(sampleRate * 1.5));
     stereoWidth.reset(sampleRate, 5.0);
     stereoBalance.reset(sampleRate, 5.0);
+    // Slower than the Smart Engine width ramp. Correlation moves with every
+    // chord change; the image must not.
+    coherenceWidth.reset(sampleRate, 3.0);
+    correlationCoefficient = std::exp(-1.0f / static_cast<float>(sampleRate * correlationIntegrationSeconds));
 
     rumbleCutoff.setCurrentAndTargetValue(20.0f);
     warmthGain.setCurrentAndTargetValue(0.0f);
@@ -69,16 +94,17 @@ void ProcessingEngine::prepare(double newSampleRate, int maximumBlockSize, int c
     wetMix.setCurrentAndTargetValue(1.0f);
     stereoWidth.setCurrentAndTargetValue(1.0f);
     stereoBalance.setCurrentAndTargetValue(0.0f);
+    coherenceWidth.setCurrentAndTargetValue(1.0f);
     dryMatchGain.setCurrentAndTargetValue(1.0f);
+    failsafeIncrement = static_cast<float>(1.0 / std::max(1.0, sampleRate * failsafeCrossfadeSeconds));
+    failsafeHoldLength = std::max(1, static_cast<int>(sampleRate * failsafeHoldSeconds));
     reset();
     configureFilters();
 }
 
-void ProcessingEngine::reset() noexcept
+void ProcessingEngine::resetProcessingState() noexcept
 {
     for (auto& channel : wetDelay)
-        channel.fill(0.0f);
-    for (auto& channel : dryDelay)
         channel.fill(0.0f);
     truePeakDetector.reset();
     dcPreviousInput.fill(0.0f);
@@ -91,6 +117,12 @@ void ProcessingEngine::reset() noexcept
     harshFilter.reset();
     sibilanceFilter.reset();
     highFilter.reset();
+    sideBassFilter.reset();
+    correlationLeftRight = 0.0;
+    correlationLeftSquare = 0.0;
+    correlationRightSquare = 0.0;
+    measuredCorrelation = 1.0f;
+    coherenceWidth.setCurrentAndTargetValue(1.0f);
     middleSplit.reset();
     lowSplit.reset();
     highSplit.reset();
@@ -101,14 +133,28 @@ void ProcessingEngine::reset() noexcept
     limiterGain = 1.0f;
     lastCompressorReduction = 0.0f;
     lastLimiterReduction = 0.0f;
+    programmeLevelSquare = 0.0f;
+    programmeLevelGain = 1.0f;
+    dryLoudnessSquare = 0.0;
+    wetLoudnessSquare = 0.0;
+    dryMatchGain.setCurrentAndTargetValue(1.0f);
+}
+
+void ProcessingEngine::reset() noexcept
+{
+    resetProcessingState();
+    for (auto& channel : dryDelay)
+        channel.fill(0.0f);
     delayWritePosition = 0;
+    failsafeBlend = 0.0f;
+    failsafeHoldSamples = 0;
+    failsafeStateCleared = true;
+    metrics.failsafeActive.store(false, std::memory_order_relaxed);
     metrics.compressorGainReductionDb.store(0.0f, std::memory_order_relaxed);
     metrics.limiterGainReductionDb.store(0.0f, std::memory_order_relaxed);
     metrics.truePeakEstimate.store(0.0f, std::memory_order_relaxed);
     metrics.abMatchGainDb.store(0.0f, std::memory_order_relaxed);
-    dryLoudnessSquare = 0.0;
-    wetLoudnessSquare = 0.0;
-    dryMatchGain.setCurrentAndTargetValue(1.0f);
+    metrics.broadcastLevelGainDb.store(0.0f, std::memory_order_relaxed);
 }
 
 void ProcessingEngine::process(float* const* channels, int numChannels, int numSamples) noexcept
@@ -133,6 +179,33 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
     const auto compressorIsEnabled = parameters.compressorEnabled.load(std::memory_order_relaxed);
     const auto saturationIsEnabled = parameters.saturationEnabled.load(std::memory_order_relaxed);
     const auto limiterIsEnabled = parameters.limiterEnabled.load(std::memory_order_relaxed);
+    const auto levelerIsEnabled = parameters.broadcastLevelerEnabled.load(std::memory_order_relaxed);
+    const auto failsafeForced = parameters.forceFailsafe.load(std::memory_order_relaxed);
+    const auto monoCompatibility = parameters.monoCompatibilityEnabled.load(std::memory_order_relaxed)
+        && activeChannels == 2;
+    if (monoCompatibility)
+        sideBassFilter.setLowPass(sampleRate,
+                                  std::clamp(parameters.bassMonoFrequencyHz.load(std::memory_order_relaxed),
+                                             40.0f, 300.0f));
+
+    // Correlation is integrated per sample but only resolved once per block:
+    // the ratio needs a square root and a division, and the width it drives
+    // ramps over seconds anyway.
+    if (activeChannels == 2 && parameters.phaseCoherenceEnabled.load(std::memory_order_relaxed))
+    {
+        const auto denominator = std::sqrt(correlationLeftSquare * correlationRightSquare);
+        measuredCorrelation = denominator > 1.0e-12
+            ? std::clamp(static_cast<float>(correlationLeftRight / denominator), -1.0f, 1.0f)
+            : 1.0f;
+        const auto span = coherenceOnsetCorrelation - coherenceWorstCorrelation;
+        const auto severity = std::clamp((coherenceOnsetCorrelation - measuredCorrelation) / span, 0.0f, 1.0f);
+        coherenceWidth.setTargetValue(1.0f - severity * (1.0f - coherenceMinimumWidth));
+    }
+    else
+    {
+        measuredCorrelation = 1.0f;
+        coherenceWidth.setTargetValue(1.0f);
+    }
 
     const auto compressorThreshold = -5.0f - dynamics * 15.0f
         + adaptiveTargets.compressionDb.load(std::memory_order_relaxed);
@@ -152,6 +225,10 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
     const auto saturationDrive = 1.0f + warmth * 0.16f;
     const auto saturationNormaliser = 1.0f / std::tanh(saturationDrive);
     const auto limiterRelease = std::exp(-1.0f / static_cast<float>(sampleRate * 0.080));
+    const auto levelDetectorAttack = std::exp(-1.0f / static_cast<float>(sampleRate * 0.25));
+    const auto levelDetectorRelease = std::exp(-1.0f / static_cast<float>(sampleRate * 1.20));
+    const auto levelGainDown = std::exp(-1.0f / static_cast<float>(sampleRate * 0.35));
+    const auto levelGainUp = std::exp(-1.0f / static_cast<float>(sampleRate * 2.00));
 
     auto blockMaxCompressorReduction = 0.0f;
     auto blockMaxLimiterReduction = 0.0f;
@@ -168,7 +245,16 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
 
         for (int channel = 0; channel < activeChannels; ++channel)
         {
-            original[channel] = channels[channel][sampleIndex];
+            auto input = channels[channel][sampleIndex];
+            if (!std::isfinite(input))
+            {
+                input = 0.0f;
+                ++nonFiniteInputCount;
+            }
+            // Clamped before the DC blocker: every stage after this one is
+            // recursive, so a single absurd sample would otherwise stay in the
+            // filter state long after the driver recovered.
+            original[channel] = std::clamp(input, -inputMagnitudeClamp, inputMagnitudeClamp);
             auto value = processDcBlocker(channel, original[channel]);
             if (rumbleIsEnabled)
                 value = rumbleFilter.process(channel, value);
@@ -227,10 +313,25 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
             wet[channel] = value * blockOutputGain;
         }
 
-        if (activeChannels == 2 && width < 0.9999f)
+        // Coherence safety never widens: it can only take back what the Smart
+        // Engine asked for, so the two controls cannot fight each other.
+        const auto safeWidth = std::min(width, coherenceWidth.getNextValue());
+        if (activeChannels == 2)
+        {
+            correlationLeftRight = correlationCoefficient * correlationLeftRight
+                + (1.0f - correlationCoefficient) * static_cast<double>(wet[0]) * wet[1];
+            correlationLeftSquare = correlationCoefficient * correlationLeftSquare
+                + (1.0f - correlationCoefficient) * static_cast<double>(wet[0]) * wet[0];
+            correlationRightSquare = correlationCoefficient * correlationRightSquare
+                + (1.0f - correlationCoefficient) * static_cast<double>(wet[1]) * wet[1];
+        }
+        if (activeChannels == 2 && (monoCompatibility || safeWidth < 0.9999f))
         {
             const auto mid = 0.5f * (wet[0] + wet[1]);
-            const auto side = 0.5f * (wet[0] - wet[1]) * width;
+            auto side = 0.5f * (wet[0] - wet[1]);
+            if (monoCompatibility)
+                side -= sideBassFilter.process(0, side);
+            side *= safeWidth;
             wet[0] = mid + side;
             wet[1] = mid - side;
         }
@@ -239,6 +340,29 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
             wet[0] *= decibelsToGain(balance * 0.5f);
             wet[1] *= decibelsToGain(-balance * 0.5f);
         }
+
+        auto programmePower = 0.0f;
+        for (int channel = 0; channel < activeChannels; ++channel)
+            programmePower += wet[channel] * wet[channel];
+        programmePower /= static_cast<float>(activeChannels);
+        const auto detectorCoefficient = programmePower > programmeLevelSquare
+            ? levelDetectorAttack : levelDetectorRelease;
+        programmeLevelSquare = detectorCoefficient * programmeLevelSquare
+            + (1.0f - detectorCoefficient) * programmePower;
+
+        auto levelTargetGain = 1.0f;
+        const auto programmeRmsDb = gainToDecibels(std::sqrt(programmeLevelSquare));
+        // The public references measure roughly -19 dBFS RMS through both
+        // worship and speech. Limit recovery to +15 dB and stop operating on
+        // near-silence, so this cannot turn room noise into a programme.
+        if (levelerIsEnabled && processedSelected && programmeRmsDb > -48.0f)
+            levelTargetGain = decibelsToGain(std::clamp(-19.0f - programmeRmsDb, -10.0f, 15.0f));
+        const auto levelGainCoefficient = levelTargetGain < programmeLevelGain
+            ? levelGainDown : levelGainUp;
+        programmeLevelGain = levelGainCoefficient * programmeLevelGain
+            + (1.0f - levelGainCoefficient) * levelTargetGain;
+        for (int channel = 0; channel < activeChannels; ++channel)
+            wet[channel] *= programmeLevelGain;
 
         auto detectedTruePeak = 0.0f;
         for (int channel = 0; channel < activeChannels; ++channel)
@@ -255,6 +379,27 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
         const auto limiterReduction = std::max(0.0f, -gainToDecibels(limiterGain, -60.0f));
         blockMaxLimiterReduction = std::max(blockMaxLimiterReduction, limiterReduction);
 
+        auto faulted = !std::isfinite(limiterGain);
+        for (int channel = 0; channel < activeChannels; ++channel)
+            faulted = faulted || !std::isfinite(wet[channel])
+                || std::abs(wet[channel]) > failsafeMagnitude;
+        if (faulted)
+        {
+            if (failsafeHoldSamples == 0 && failsafeBlend <= 0.0f)
+                ++failsafeEngagementCount;
+            failsafeHoldSamples = failsafeHoldLength;
+            failsafeStateCleared = false;
+            // Never let the broken sample into the delay line: it would come
+            // back out one lookahead later, after the crossfade had settled.
+            for (int channel = 0; channel < activeChannels; ++channel)
+                wet[channel] = 0.0f;
+        }
+        // A forced failsafe is an operator or supervisor decision, not a DSP
+        // fault: it holds the dry path open without counting an engagement and
+        // without discarding filter state that was never broken.
+        if (failsafeForced)
+            failsafeHoldSamples = std::max(failsafeHoldSamples, 1);
+
         const auto mix = wetMix.getNextValue();
         const auto matchGain = dryMatchGain.getNextValue();
 
@@ -270,10 +415,33 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
             const auto matchedDry = delayedDry * matchGain;
             dryMono += delayedDry;
             wetMono += limitedWet;
-            channels[channel][sampleIndex] = matchedDry + (limitedWet - matchedDry) * mix;
+            const auto processed = matchedDry + (limitedWet - matchedDry) * mix;
+            // The safety path is the delayed dry signal, unmatched and
+            // unprocessed: it stays sample aligned with the reported latency,
+            // and like bypass it is never gain matched.
+            channels[channel][sampleIndex] = processed + (delayedDry - processed) * failsafeBlend;
         }
         const auto monoScale = activeChannels > 1 ? 0.5f : 1.0f;
         updateLoudnessMatch(dryMono * monoScale, wetMono * monoScale);
+
+        const auto failsafeTarget = failsafeHoldSamples > 0 ? 1.0f : 0.0f;
+        if (failsafeBlend < failsafeTarget)
+            failsafeBlend = std::min(failsafeTarget, failsafeBlend + failsafeIncrement);
+        else if (failsafeBlend > failsafeTarget)
+            failsafeBlend = std::max(failsafeTarget, failsafeBlend - failsafeIncrement);
+
+        if (failsafeHoldSamples > 0)
+        {
+            --failsafeHoldSamples;
+            // Clearing the poisoned state is only safe once the processed path
+            // is fully muted, otherwise the reset itself becomes an audible
+            // click on top of the fault it is repairing.
+            if (!failsafeStateCleared && failsafeBlend >= 1.0f)
+            {
+                resetProcessingState();
+                failsafeStateCleared = true;
+            }
+        }
 
         if (++delayWritePosition >= lookaheadSamples)
             delayWritePosition = 0;
@@ -285,7 +453,14 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
     metrics.limiterGainReductionDb.store(lastLimiterReduction, std::memory_order_release);
     metrics.truePeakEstimate.store(blockTruePeak, std::memory_order_release);
     metrics.appliedOutputGainDb.store(gainToDecibels(outputGain.getCurrentValue()), std::memory_order_release);
+    metrics.broadcastLevelGainDb.store(gainToDecibels(programmeLevelGain), std::memory_order_release);
     metrics.abMatchGainDb.store(gainToDecibels(dryMatchGain.getCurrentValue(), -24.0f), std::memory_order_release);
+    metrics.failsafeActive.store(failsafeBlend > 0.0f, std::memory_order_release);
+    metrics.failsafeEngagements.store(failsafeEngagementCount, std::memory_order_release);
+    metrics.nonFiniteInputSamples.store(nonFiniteInputCount, std::memory_order_release);
+    metrics.programmeCorrelation.store(measuredCorrelation, std::memory_order_release);
+    metrics.appliedStereoWidth.store(std::min(stereoWidth.getCurrentValue(), coherenceWidth.getCurrentValue()),
+                                     std::memory_order_release);
 }
 
 void ProcessingEngine::updateLoudnessMatch(float dryMono, float wetMono) noexcept
@@ -299,7 +474,9 @@ void ProcessingEngine::updateLoudnessMatch(float dryMono, float wetMono) noexcep
 float ProcessingEngine::processDcBlocker(int channel, float sample) noexcept
 {
     const auto index = static_cast<size_t>(channel);
-    const auto output = sample - dcPreviousInput[index] + 0.995f * dcPreviousOutput[index];
+    auto output = sample - dcPreviousInput[index] + 0.995f * dcPreviousOutput[index];
+    if (!std::isfinite(output))
+        output = 0.0f;
     dcPreviousInput[index] = sample;
     dcPreviousOutput[index] = output;
     return output;
@@ -352,8 +529,13 @@ void ProcessingEngine::updateTargets(int numSamples) noexcept
         && parameters.abLoudnessMatch.load(std::memory_order_relaxed);
     auto matchTarget = 1.0f;
     if (matchRequested && dryLoudnessSquare > 1.0e-9 && wetLoudnessSquare > 1.0e-9)
-        matchTarget = std::clamp(static_cast<float>(std::sqrt(wetLoudnessSquare / dryLoudnessSquare)),
-                                 decibelsToGain(-12.0f), decibelsToGain(12.0f));
+    {
+        // std::clamp propagates NaN rather than rejecting it, so the ratio is
+        // checked before it can be latched into the smoother for good.
+        const auto ratio = static_cast<float>(std::sqrt(wetLoudnessSquare / dryLoudnessSquare));
+        if (std::isfinite(ratio))
+            matchTarget = std::clamp(ratio, decibelsToGain(-12.0f), decibelsToGain(12.0f));
+    }
     dryMatchGain.setTargetValue(matchTarget);
     dryMatchGain.skip(numSamples);
 }

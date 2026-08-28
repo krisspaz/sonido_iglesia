@@ -49,6 +49,33 @@ SafetyState SafetyController::evaluate(const SafetyInput& input, float elapsedSe
         next.reduceSecondaryWork = true;
         addEvent(next, "Realtime deadline missed", "Reduce secondary work and preserve DSP", true);
     }
+    // The first evaluation only records the counters it finds. Without this the
+    // controller would report a fault on startup whenever the engine had
+    // already been running, for instance after a device change.
+    const auto newFailsafes = watchdogBaselineReady
+        && input.dspFailsafeEngagements > previousFailsafeEngagements;
+    const auto newInputFaults = watchdogBaselineReady
+        && input.nonFiniteInputSamples > previousNonFiniteInputSamples;
+    failsafeNoticeSeconds = newFailsafes || input.dspFailsafeActive
+        ? 30.0f : std::max(0.0f, failsafeNoticeSeconds - dt);
+    inputFaultNoticeSeconds = newInputFaults
+        ? 30.0f : std::max(0.0f, inputFaultNoticeSeconds - dt);
+
+    if (failsafeNoticeSeconds > 0.0f)
+    {
+        addEvent(next, "DSP failsafe engaged",
+                 "Processed path replaced by dry audio; rollback and inspect", true);
+        // Whatever diverged was most likely an adaptive correction, so undo
+        // them rather than letting the engine walk straight back into it.
+        if (rollbackCooldown <= 0.0f)
+        {
+            next.requestSmartRollback = true;
+            rollbackCooldown = 15.0f;
+        }
+    }
+    if (inputFaultNoticeSeconds > 0.0f)
+        addEvent(next, "Broken input samples",
+                 "Driver delivered non-finite audio; check device and sample rate", true);
     if (badPhaseSeconds >= 3.0f)
         addEvent(next, "Phase risk", "Narrow stereo image gradually", false);
     if (excessiveProcessingSeconds >= 2.0f)
@@ -63,6 +90,9 @@ SafetyState SafetyController::evaluate(const SafetyInput& input, float elapsedSe
 
     previousXruns = input.xruns;
     previousDrops = input.analysisDrops;
+    previousFailsafeEngagements = input.dspFailsafeEngagements;
+    previousNonFiniteInputSamples = input.nonFiniteInputSamples;
+    watchdogBaselineReady = true;
     next.healthy = next.eventCount == 0;
     state = next;
     return state;

@@ -40,6 +40,8 @@ juce_add_gui_app(ChurchStreamProcessor
     COMPANY_NAME "Church Stream Processor"
     BUNDLE_ID "org.churchstream.processor"
     VERSION ${PROJECT_VERSION}
+    ICON_BIG assets/church-stream-icon.png
+    ICON_SMALL assets/church-stream-icon.png
     MICROPHONE_PERMISSION_ENABLED TRUE
     MICROPHONE_PERMISSION_TEXT "Church Stream Processor needs microphone/audio-input access to receive the X32 stereo mix."
 )
