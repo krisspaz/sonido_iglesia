@@ -13,6 +13,14 @@ constexpr std::array<float, 5> bandQ { 0.70f, 0.75f, 0.62f, 0.62f, 0.70f };
 // The masking controller only ever moves bands 2 and 3.
 constexpr float presenceHz = 1100.0f;
 constexpr float upperHz = 4500.0f;
+constexpr unsigned char voiceActiveFlag = 1U << 0U;
+constexpr unsigned char activeFlag = 1U << 1U;
+constexpr unsigned char appliedFlag = 1U << 2U;
+}
+
+GroupMixer::GroupMixer() noexcept
+{
+    publishDecision({});
 }
 
 void GroupMixer::BandAnalyser::configure(double rate) noexcept
@@ -89,8 +97,8 @@ void GroupMixer::reset() noexcept
         filter.reset();
     presenceGain.setCurrentAndTargetValue(0.0f);
     upperGain.setCurrentAndTargetValue(0.0f);
-    const juce::SpinLock::ScopedLockType lock(decisionLock);
     decision = {};
+    publishDecision(decision);
 }
 
 bool GroupMixer::process(const float* const* inputs, int inputCount,
@@ -114,11 +122,7 @@ bool GroupMixer::process(const float* const* inputs, int inputCount,
         return false;
 
     const auto maskingOn = maskingEnabled.load(std::memory_order_acquire);
-    MaskingDecision current;
-    {
-        const juce::SpinLock::ScopedLockType lock(decisionLock);
-        current = decision;
-    }
+    const auto current = decision;
     presenceGain.setTargetValue(maskingOn ? current.musicGainDb[2] : 0.0f);
     upperGain.setTargetValue(maskingOn ? current.musicGainDb[3] : 0.0f);
     // Coefficients are recomputed once per block, not per sample: the masking
@@ -165,16 +169,45 @@ bool GroupMixer::process(const float* const* inputs, int inputCount,
     const auto elapsed = static_cast<float>(sampleCount / sampleRate);
     auto updated = masking.update(voiceFeatures, musicFeatures, elapsed);
     updated.applied = maskingOn && updated.active;
-    {
-        const juce::SpinLock::ScopedLockType lock(decisionLock);
-        decision = updated;
-    }
+    decision = updated;
+    publishDecision(decision);
     return true;
+}
+
+void GroupMixer::publishDecision(const MaskingDecision& value) noexcept
+{
+    publishedVersion.fetch_add(1U, std::memory_order_release);
+    for (size_t band = 0; band < publishedMusicGainDb.size(); ++band)
+        publishedMusicGainDb[band].store(value.musicGainDb[band], std::memory_order_relaxed);
+    publishedConfidence.store(value.confidence, std::memory_order_relaxed);
+
+    auto flags = static_cast<unsigned char>(0U);
+    if (value.voiceActive) flags |= voiceActiveFlag;
+    if (value.active) flags |= activeFlag;
+    if (value.applied) flags |= appliedFlag;
+    publishedFlags.store(flags, std::memory_order_relaxed);
+    publishedVersion.fetch_add(1U, std::memory_order_release);
 }
 
 MaskingDecision GroupMixer::getDecision() const noexcept
 {
-    const juce::SpinLock::ScopedLockType lock(decisionLock);
-    return decision;
+    MaskingDecision snapshot;
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        const auto before = publishedVersion.load(std::memory_order_acquire);
+        if ((before & 1U) != 0U) continue;
+
+        for (size_t band = 0; band < snapshot.musicGainDb.size(); ++band)
+            snapshot.musicGainDb[band] = publishedMusicGainDb[band].load(std::memory_order_relaxed);
+        snapshot.confidence = publishedConfidence.load(std::memory_order_relaxed);
+        const auto flags = publishedFlags.load(std::memory_order_relaxed);
+        snapshot.voiceActive = (flags & voiceActiveFlag) != 0U;
+        snapshot.active = (flags & activeFlag) != 0U;
+        snapshot.applied = (flags & appliedFlag) != 0U;
+
+        if (before == publishedVersion.load(std::memory_order_acquire))
+            return snapshot;
+    }
+    return snapshot;
 }
 } // namespace churchstream

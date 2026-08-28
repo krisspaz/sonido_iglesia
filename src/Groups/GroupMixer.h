@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <juce_audio_basics/juce_audio_basics.h>
 
 namespace churchstream
@@ -19,6 +20,8 @@ namespace churchstream
 class GroupMixer final
 {
 public:
+    GroupMixer() noexcept;
+
     void prepare(double newSampleRate) noexcept;
     void reset() noexcept;
 
@@ -52,6 +55,8 @@ private:
         [[nodiscard]] GroupFeatures finish(int sampleCount) noexcept;
     };
 
+    void publishDecision(const MaskingDecision& value) noexcept;
+
     double sampleRate = 48000.0;
     std::atomic<bool> maskingEnabled { false };
     BandAnalyser voiceAnalyser;
@@ -61,7 +66,12 @@ private:
     juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> presenceGain;
     juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> upperGain;
 
-    mutable juce::SpinLock decisionLock;
     MaskingDecision decision;
+    // The audio callback owns decision. The UI reads a lock-free published
+    // snapshot, so diagnostics can never stall the real-time path.
+    std::array<std::atomic<float>, 5> publishedMusicGainDb;
+    std::atomic<float> publishedConfidence { 0.0f };
+    std::atomic<unsigned char> publishedFlags { 0U };
+    std::atomic<std::uint32_t> publishedVersion { 0U };
 };
 } // namespace churchstream

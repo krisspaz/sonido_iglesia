@@ -575,7 +575,7 @@ void MainComponent::timerCallback()
             audioEngine.getProcessingEngine().getParameters().limiterEnabled.store(true, std::memory_order_release);
         if (safety.requestSmartRollback)
             audioEngine.getSmartEngine().requestSafetyRollback();
-        if (safety.requestX32Reconnect)
+        if (safety.requestX32Reconnect && !liveRoutingLocked())
             [[maybe_unused]] const auto reconnected = audioEngine.reconnectIfNeeded();
         if (safety.requestObsReconnect && now - lastSafetyObsReconnectMs >= 10000.0)
         {
@@ -599,17 +599,21 @@ void MainComponent::timerCallback()
     if (deviceListsDirty)
     {
         deviceListsDirty = false;
-        if (audioEngine.isInitialised() && !audioEngine.isX32Connected())
+        if (liveRoutingLocked())
         {
-            [[maybe_unused]] const auto recoveryResult = audioEngine.autoConfigure();
-            // Recovery is allowed even in LIVE MODE after a physical disconnect.
+            showResult("Audio device changed during STREAM LIVE. Current routing is preserved; reconnect after stopping the stream.", {});
         }
-        refreshDeviceLists();
+        else
+        {
+            if (audioEngine.isInitialised() && !audioEngine.isX32Connected())
+                [[maybe_unused]] const auto recoveryResult = audioEngine.autoConfigure();
+            refreshDeviceLists();
+        }
     }
     if (now - lastReconnectAttemptMs >= 5000.0)
     {
         lastReconnectAttemptMs = now;
-        if (audioEngine.isInitialised() && !audioEngine.isX32Connected()
+        if (!liveRoutingLocked() && audioEngine.isInitialised() && !audioEngine.isX32Connected()
             && audioEngine.reconnectIfNeeded()) refreshDeviceLists();
         // Console names are only naming hints for the group router, so a slow
         // refresh off the audio thread is enough.

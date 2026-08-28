@@ -1241,6 +1241,7 @@ CSP_TEST_CASE void testGroupMixerFallbackAndMasking()
     expect(approximately(decision.musicGainDb[0], 0.0f, 1.0e-4f)
            && approximately(decision.musicGainDb[4], 0.0f, 1.0e-4f),
            "masking must leave the low and high bands of the music alone");
+
 }
 
 CSP_TEST_CASE void testRoomCalibrationMeasuresDecayAndResonance()

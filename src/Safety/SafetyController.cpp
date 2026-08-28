@@ -25,7 +25,7 @@ SafetyState SafetyController::evaluate(const SafetyInput& input, float elapsedSe
     if (disconnectedSeconds >= 2.0f)
     {
         next.requestX32Reconnect = true;
-        addEvent(next, "X32 disconnected", "Automatic reconnection", true);
+        addEvent(next, "X32 disconnected", "Reconnect when the stream is stopped", true);
     }
     if (silenceSeconds >= 5.0f)
         addEvent(next, "Unexpected stream silence", "Keep limiter active and alert operator", true);

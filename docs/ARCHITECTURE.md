@@ -16,7 +16,7 @@ El driver virtual se deriva de una revisión fijada de Microsoft SysVAD. El rend
 
 ## Thread de audio
 
-Sólo ejecuta copias de buffer, meters O(n), DSP preasignado y pushes lock-free. No hace disco, logs, red, JSON, OBS, ventanas, carga de archivos ni reserva deliberada de memoria. `ScopedNoDenormals` evita penalizaciones de CPU al decaer filtros/envolventes.
+Sólo ejecuta copias de buffer, meters O(n), DSP preasignado y comunicación lock-free con análisis/UI. No hace disco, logs, red, JSON, OBS, ventanas, carga de archivos ni reserva deliberada de memoria. Los diagnósticos de Smart Masking se publican mediante un snapshot atómico; las pistas de nombres X32 también cruzan hacia el router como atomics. `ScopedNoDenormals` evita penalizaciones de CPU al decaer filtros/envolventes.
 
 Cadena real:
 

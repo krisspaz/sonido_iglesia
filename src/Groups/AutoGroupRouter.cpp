@@ -51,6 +51,9 @@ void AutoGroupRouter::reset() noexcept
         routePairs[static_cast<size_t>(role)].store(-1, std::memory_order_release);
         routeConfidence[static_cast<size_t>(role)].store(0.0f, std::memory_order_release);
     }
+    for (auto& pairHints : nameHints)
+        for (auto& hint : pairHints)
+            hint.store(0.0f, std::memory_order_release);
 }
 
 void AutoGroupRouter::process(const float* const* channels, int channelCount, int sampleCount) noexcept
@@ -138,6 +141,13 @@ void AutoGroupRouter::process(const float* const* channels, int channelCount, in
 
 void AutoGroupRouter::evaluate(int pairCount) noexcept
 {
+    const auto scoreFor = [this](int pair, GroupRole role)
+    {
+        const auto roleIndex = static_cast<size_t>(role);
+        const auto nameHint = nameHints[static_cast<size_t>(pair)][roleIndex].load(std::memory_order_acquire);
+        return roleScore(candidates[static_cast<size_t>(pair)], role, nameHint);
+    };
+
     Assignment best;
     for (int voice = 0; voice < pairCount; ++voice)
         for (int music = 0; music < pairCount; ++music)
@@ -145,9 +155,9 @@ void AutoGroupRouter::evaluate(int pairCount) noexcept
             {
                 if (voice == music || voice == ambience || music == ambience) continue;
                 const std::array<float, 3> scores {
-                    roleScore(candidates[static_cast<size_t>(voice)], GroupRole::voice),
-                    roleScore(candidates[static_cast<size_t>(music)], GroupRole::music),
-                    roleScore(candidates[static_cast<size_t>(ambience)], GroupRole::ambience)
+                    scoreFor(voice, GroupRole::voice),
+                    scoreFor(music, GroupRole::music),
+                    scoreFor(ambience, GroupRole::ambience)
                 };
                 const auto total = scores[0] + scores[1] + scores[2];
                 if (total > best.score)
@@ -165,8 +175,7 @@ void AutoGroupRouter::evaluate(int pairCount) noexcept
         auto alternate = 0.0f;
         for (int pair = 0; pair < pairCount; ++pair)
             if (pair != best.pair[static_cast<size_t>(role)])
-                alternate = std::max(alternate, roleScore(candidates[static_cast<size_t>(pair)],
-                    static_cast<GroupRole>(role)));
+                alternate = std::max(alternate, scoreFor(pair, static_cast<GroupRole>(role)));
         const auto separation = clamp01((best.confidence[static_cast<size_t>(role)] - alternate + 0.18f) / 0.36f);
         best.confidence[static_cast<size_t>(role)] =
             clamp01(0.65f * best.confidence[static_cast<size_t>(role)] + 0.35f * separation);
@@ -198,7 +207,7 @@ void AutoGroupRouter::evaluate(int pairCount) noexcept
         phase.store(static_cast<int>(AutoRoutePhase::uncertain), std::memory_order_release);
 }
 
-float AutoGroupRouter::roleScore(const Candidate& candidate, GroupRole role) noexcept
+float AutoGroupRouter::roleScore(const Candidate& candidate, GroupRole role, float nameHint) noexcept
 {
     const auto crest = clamp01((candidate.crest - 1.0f) / 4.0f);
     const auto tonalTotal = std::max(candidate.lowRatio + candidate.midRatio + candidate.highRatio, 1.0e-5f);
@@ -209,24 +218,24 @@ float AutoGroupRouter::roleScore(const Candidate& candidate, GroupRole role) noe
         return clamp01(0.27f * closeness(mid, 0.62f, 0.55f)
                        + 0.22f * (1.0f - candidate.width)
                        + 0.16f * crest + 0.12f * (1.0f - low)
-                       + 0.08f * candidate.activity + 0.15f * candidate.nameVoice);
+                       + 0.08f * candidate.activity + 0.15f * nameHint);
     if (role == GroupRole::music)
         return clamp01(0.20f * candidate.activity + 0.17f * candidate.level
                        + 0.17f * candidate.width + 0.14f * closeness(low, 0.24f, 0.24f)
                        + 0.12f * closeness(high, 0.20f, 0.28f)
-                       + 0.20f * candidate.nameMusic);
+                       + 0.20f * nameHint);
     return clamp01(0.25f * candidate.width + 0.18f * high
                    + 0.18f * (1.0f - candidate.level) + 0.10f * (1.0f - crest)
-                   + 0.09f * candidate.activity + 0.20f * candidate.nameAmbience);
+                   + 0.09f * candidate.activity + 0.20f * nameHint);
 }
 
 void AutoGroupRouter::setCandidateName(int pairIndex, const std::string& name)
 {
     if (pairIndex < 0 || pairIndex >= maxCandidatePairs) return;
-    auto& candidate = candidates[static_cast<size_t>(pairIndex)];
-    candidate.nameVoice = keywordScore(name, GroupRole::voice);
-    candidate.nameMusic = keywordScore(name, GroupRole::music);
-    candidate.nameAmbience = keywordScore(name, GroupRole::ambience);
+    auto& hints = nameHints[static_cast<size_t>(pairIndex)];
+    hints[static_cast<size_t>(GroupRole::voice)].store(keywordScore(name, GroupRole::voice), std::memory_order_release);
+    hints[static_cast<size_t>(GroupRole::music)].store(keywordScore(name, GroupRole::music), std::memory_order_release);
+    hints[static_cast<size_t>(GroupRole::ambience)].store(keywordScore(name, GroupRole::ambience), std::memory_order_release);
 }
 
 float AutoGroupRouter::keywordScore(const std::string& original, GroupRole role)

@@ -20,7 +20,7 @@ Esta prueba convierte el build en un candidato de producción. Ejecutarla en Win
 6. Iniciar grabación local y stream de prueba. Confirmar STREAM LIVE sin detener audio.
 7. Mover Clean/Punch/Clarity/Dynamics/Warmth de 0 a 100, A/B y Bypass. Escuchar con audífonos y revisar waveform: sin click, pop, silencio ni salto duro.
 8. Ejecutar Auto Tune durante 25 s; confirmar progreso, perfil y targets graduales.
-9. Desconectar/reconectar USB X32. Debe mostrar DISCONNECTED y recuperar automáticamente cada 5 s sin reiniciar la app.
+9. Desconectar/reconectar USB X32 durante STREAM LIVE. Debe mostrar DISCONNECTED sin bloquear la interfaz ni reconfigurar dispositivos. Detener el stream, pulsar AUTO CONFIGURE y confirmar la recuperación sin reiniciar la app.
 10. Cerrar/reabrir OBS. Debe reconectar aproximadamente cada 2.5 s y restaurar estado/fuente.
 11. Suspender/reanudar Windows y repetir señal estéreo.
 

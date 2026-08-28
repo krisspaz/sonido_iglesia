@@ -27,6 +27,8 @@ class AutoGroupRouter final
 public:
     static constexpr int maxCandidatePairs = 4;
 
+    AutoGroupRouter() noexcept { reset(); }
+
     void prepare(double newSampleRate) noexcept;
     void reset() noexcept;
     void process(const float* const* channels, int channelCount, int sampleCount) noexcept;
@@ -47,9 +49,6 @@ private:
         float width = 0.0f;
         float crest = 1.0f;
         float activity = 0.0f;
-        float nameVoice = 0.0f;
-        float nameMusic = 0.0f;
-        float nameAmbience = 0.0f;
     };
 
     struct Assignment
@@ -60,10 +59,13 @@ private:
     };
 
     void evaluate(int pairCount) noexcept;
-    [[nodiscard]] static float roleScore(const Candidate&, GroupRole) noexcept;
+    [[nodiscard]] static float roleScore(const Candidate&, GroupRole, float nameHint) noexcept;
     [[nodiscard]] static float keywordScore(const std::string&, GroupRole);
 
     std::array<Candidate, maxCandidatePairs> candidates;
+    // Channel labels arrive from the UI/OSC side while process() runs in the
+    // audio callback. Keep that crossing lock-free and race-free.
+    std::array<std::array<std::atomic<float>, 3>, maxCandidatePairs> nameHints;
     double sampleRate = 48000.0;
     double analysedSamples = 0.0;
     float evaluationCountdown = 0.0f;
