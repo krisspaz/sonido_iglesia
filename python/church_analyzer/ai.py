@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -45,6 +46,7 @@ def separate(path: str, output_dir: str, two_stems: bool = False, progress=None,
     if progress:
         progress(.05, "Iniciando Demucs")
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    deadline = time.monotonic() + 3600
     try:
         while process.poll() is None:
             if cancelled and cancelled.is_set():
@@ -53,6 +55,11 @@ def separate(path: str, output_dir: str, two_stems: bool = False, progress=None,
                 return {"available": False, "cancelled": True, "output_dir": str(destination)}
             if progress:
                 progress(.5, "Separando fuentes con Demucs")
+            if time.monotonic() >= deadline:
+                process.terminate()
+                process.wait(timeout=10)
+                return {"available": False, "timed_out": True, "output_dir": str(destination),
+                        "error": "Demucs superó el límite de una hora"}
             # poll at a bounded interval without blocking service shutdown.
             try:
                 process.wait(timeout=.25)
