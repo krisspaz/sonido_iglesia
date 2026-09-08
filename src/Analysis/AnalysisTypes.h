@@ -37,7 +37,15 @@ struct SignalMetrics
     float leftRightImbalanceDb = 0.0f;
     float spectralCentroidHz = 0.0f;
     float transientDensity = 0.0f;
+    // Share of total power per band. Convenient, but coupled: a loud kick
+    // raises band 0's share and lowers every other band's share at the same
+    // time, so a decision made purely on shares reads one loud instrument as
+    // both "too much low end" and "not enough presence".
     std::array<float, 5> bandEnergy { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    // The same five bands as absolute levels. Uncalibrated against any
+    // reference, so only differences are meaningful, which is all the decisions
+    // need: they compare against a baseline measured the same way.
+    std::array<float, 5> bandLevelDb { -100.0f, -100.0f, -100.0f, -100.0f, -100.0f };
     std::array<float, spectrumBins> spectrumDb {};
 };
 

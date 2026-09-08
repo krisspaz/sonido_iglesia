@@ -5,6 +5,15 @@
 
 namespace churchstream
 {
+namespace
+{
+// How far a band has to have actually moved, in dB, before a share-based
+// severity is believed in full. Small enough that a real tonal problem is never
+// held back, large enough to reject the share movement one loud instrument
+// causes in all five bands at once.
+constexpr float absoluteConfirmationDb = 1.5f;
+}
+
 SmartEngine::SmartEngine(AnalysisEngine& analysisToUse, ProcessingEngine& processingToUse,
                          juce::File profileFileToUse, juce::String churchNameToUse)
     : Thread("CSP Smart Decision Thread"), analysis(analysisToUse), processing(processingToUse),
@@ -184,6 +193,15 @@ void SmartEngine::updateAutoTune(const SignalMetrics& metrics, float elapsedSeco
     autoTuneElapsed += elapsedSeconds;
     for (size_t band = 0; band < autoTuneAccumulator.bands.size(); ++band)
         autoTuneAccumulator.bands[band] += metrics.bandEnergy[band];
+    // Only counted when the analyser actually reported levels. A snapshot that
+    // carries shares but no levels must leave the absolute baseline unset
+    // rather than average in a floor value that would then be compared against.
+    if (metrics.bandLevelDb[0] > -90.0f)
+    {
+        for (size_t band = 0; band < autoTuneAccumulator.bandLevels.size(); ++band)
+            autoTuneAccumulator.bandLevels[band] += metrics.bandLevelDb[band];
+        ++autoTuneAccumulator.levelCount;
+    }
     autoTuneAccumulator.loudness += metrics.lufsShortTerm > -70.0f ? metrics.lufsShortTerm : metrics.rmsDb;
     autoTuneAccumulator.crest += metrics.crestFactorDb;
     autoTuneAccumulator.centroid += metrics.spectralCentroidHz;
@@ -207,6 +225,13 @@ void SmartEngine::updateAutoTune(const SignalMetrics& metrics, float elapsedSeco
     baseline.centroid = static_cast<float>(autoTuneAccumulator.centroid / divisor);
     baseline.stereoWidth = static_cast<float>(autoTuneAccumulator.stereoWidth / divisor);
     baseline.sibilance = static_cast<float>(autoTuneAccumulator.sibilance / divisor);
+    baseline.levelsReady = autoTuneAccumulator.levelCount > 0;
+    if (baseline.levelsReady)
+    {
+        const auto levelDivisor = static_cast<double>(autoTuneAccumulator.levelCount);
+        for (size_t band = 0; band < baseline.bandLevels.size(); ++band)
+            baseline.bandLevels[band] = static_cast<float>(autoTuneAccumulator.bandLevels[band] / levelDivisor);
+    }
     baseline.ready = true;
 
     const auto profile = detectProfile(baseline);
@@ -224,14 +249,40 @@ void SmartEngine::updateAutoTune(const SignalMetrics& metrics, float elapsedSeco
 void SmartEngine::decide(const AnalysisSnapshot& snapshot, float elapsedSeconds, SmartState& next)
 {
     const auto& metrics = snapshot.processed;
+
+    // Shares detect the problem; absolute levels confirm which band actually
+    // moved. They are needed together because a share is normalised by the
+    // total: one loud kick raises band 0's share and lowers all four others at
+    // the same instant, so a decision made on shares alone reads a single event
+    // as excess low end *and* a presence deficit, and applies both corrections.
+    // The confirmation can only ever withhold a correction, never invent one,
+    // and it stays neutral until Auto Tune has measured an absolute baseline to
+    // compare against.
+    std::array<float, 5> bandConfirmation { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+    if (baseline.levelsReady && metrics.bandLevelDb[0] > -90.0f)
+    {
+        for (size_t band = 0; band < bandConfirmation.size(); ++band)
+        {
+            // Band 2 is the only deficit detector: it fires when presence has
+            // fallen away, so its sign is the opposite of the others.
+            const auto movedDb = band == 2
+                ? baseline.bandLevels[band] - metrics.bandLevelDb[band]
+                : metrics.bandLevelDb[band] - baseline.bandLevels[band];
+            bandConfirmation[band] = std::clamp(movedDb / absoluteConfirmationDb, 0.0f, 1.0f);
+        }
+    }
+
     const auto lowSeverity = std::max(0.0f, metrics.bandEnergy[0] - baseline.bands[0] - 0.035f) / 0.12f
-        * (next.context == MixContext::fullBand ? 1.10f : 1.0f);
+        * (next.context == MixContext::fullBand ? 1.10f : 1.0f) * bandConfirmation[0];
     const auto mudSeverity = std::max(0.0f, metrics.bandEnergy[1] - baseline.bands[1] - 0.045f) / 0.15f
-        * (next.context == MixContext::denseMusic ? 1.15f : 1.0f);
+        * (next.context == MixContext::denseMusic ? 1.15f : 1.0f) * bandConfirmation[1];
     const auto claritySeverity = std::max(0.0f, baseline.bands[2] - metrics.bandEnergy[2] - 0.05f) / 0.15f
-        * (next.context == MixContext::speech || next.context == MixContext::soloVocal ? 1.15f : 1.0f);
-    const auto harshSeverity = std::max(0.0f, metrics.bandEnergy[3] - baseline.bands[3] - 0.045f) / 0.14f;
-    const auto highSeverity = std::max(0.0f, metrics.bandEnergy[4] - baseline.bands[4] - 0.025f) / 0.10f;
+        * (next.context == MixContext::speech || next.context == MixContext::soloVocal ? 1.15f : 1.0f)
+        * bandConfirmation[2];
+    const auto harshSeverity = std::max(0.0f, metrics.bandEnergy[3] - baseline.bands[3] - 0.045f) / 0.14f
+        * bandConfirmation[3];
+    const auto highSeverity = std::max(0.0f, metrics.bandEnergy[4] - baseline.bands[4] - 0.025f) / 0.10f
+        * bandConfirmation[4];
     const auto rumbleRatio = spectrumEnergy(metrics, snapshot.sampleRate, 20.0f, 40.0f);
     const auto rumbleSeverity = std::max(0.0f, rumbleRatio - 0.035f) / 0.08f;
     const auto stereoSeverity = std::max(0.0f, -0.15f - metrics.stereoCorrelation) / 0.85f;
@@ -493,6 +544,12 @@ void SmartEngine::loadProfile()
     baseline.crest = static_cast<float>(root->getProperty("baselineCrest"));
     baseline.centroid = static_cast<float>(root->getProperty("baselineCentroid"));
     baseline.stereoWidth = static_cast<float>(root->getProperty("baselineStereoWidth"));
+    if (const auto* levels = root->getProperty("baselineBandLevels").getArray())
+    {
+        for (int index = 0; index < std::min(5, levels->size()); ++index)
+            baseline.bandLevels[static_cast<size_t>(index)] = static_cast<float>((*levels)[index]);
+        baseline.levelsReady = levels->size() >= 5 && baseline.bandLevels[0] > -90.0f;
+    }
     if (root->hasProperty("baselineSibilance"))
         baseline.sibilance = std::clamp(static_cast<float>(root->getProperty("baselineSibilance")), 0.0f, 0.6f);
     baseline.ready = static_cast<bool>(root->getProperty("baselineReady"));
@@ -506,7 +563,7 @@ void SmartEngine::saveProfile()
     if (profileFile == juce::File()) return;
     profileFile.getParentDirectory().createDirectory();
     auto root = juce::DynamicObject::Ptr(new juce::DynamicObject());
-    root->setProperty("schemaVersion", 3);
+    root->setProperty("schemaVersion", 4);
     juce::String profileChurchName;
     {
         const juce::ScopedLock lock(stateLock);
@@ -522,9 +579,12 @@ void SmartEngine::saveProfile()
     root->setProperty("baselineStereoWidth", baseline.stereoWidth);
     root->setProperty("baselineSibilance", baseline.sibilance);
     root->setProperty("mixProfile", static_cast<int>(detectProfile(baseline)));
-    juce::Array<juce::var> bands, learned;
+    juce::Array<juce::var> bands, learned, bandLevels;
     for (const auto value : baseline.bands) bands.add(value);
     for (const auto value : learnedEffectiveness) learned.add(value);
+    if (baseline.levelsReady)
+        for (const auto value : baseline.bandLevels) bandLevels.add(value);
+    root->setProperty("baselineBandLevels", juce::var(bandLevels));
     root->setProperty("baselineBands", juce::var(bands));
     root->setProperty("learnedEffectiveness", juce::var(learned));
     if (profileFile.replaceWithText(juce::JSON::toString(juce::var(root.get()), true)))

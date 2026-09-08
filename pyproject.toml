@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "church-stream-analyzer"
+version = "0.1.0"
+description = "Analizador offline y API local para mezclas de culto"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+analysis = ["numpy>=1.24", "scipy>=1.10", "soundfile>=0.12", "pyloudnorm>=0.2"]
+server = ["fastapi>=0.100", "uvicorn[standard]>=0.23", "python-multipart>=0.0.6"]
+ai = ["openai-whisper>=20231117", "demucs>=4.0"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+church-analyze = "church_analyzer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.setuptools]
+package-dir = {"" = "python"}

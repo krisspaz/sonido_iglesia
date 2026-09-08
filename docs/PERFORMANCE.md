@@ -25,6 +25,8 @@ Esto acelera cuatro horas de contenido; sirve para estabilidad numérica y throu
 
 Resultado local largo de referencia: 14 400 s procesados en 114.419 s (`125.85×`, equivalente a `0.794577%` de un núcleo), salida finita y dentro del rango de la señal de prueba. La repetición Release más reciente de 600 s dio `129.96×` y `0.769468%` de un núcleo.
 
+Tras añadir EQ dinámica, de-esser dinámico, ponderación K en el leveller, rumble de 4º orden y mínimo deslizante en el limitador, la misma prueba Release de 600 s da `70.69×`, equivalente a `1.415%` de un núcleo. El costo se duplicó y sigue dentro de la banda ideal de 1–3%: son unas doce evaluaciones de biquad extra por muestra (seis de los pasos banda dinámicos por dos canales, cuatro de la ponderación K, dos del rumble adicional). El benchmark mide sólo `ProcessingEngine`, no el hilo de análisis. `sampled_maximum` no cambió (`0.7792`), así que el acotamiento de la salida es el mismo.
+
 La medición anterior (`135.35×` y `144.10×`) es de la cadena sin detección true-peak sobremuestreada. El detector 4x polifásico del limitador, el de-esser dinámico y el integrador de A/B igualado cuestan alrededor de un 10% del tiempo de DSP; se aceptó ese costo porque la interpolación cúbica anterior subestimaba el pico inter-muestra que protege el techo de -1 dBTP.
 
 La suite y 600 s adicionales también pasaron bajo AddressSanitizer + UndefinedBehaviorSanitizer. El benchmark instrumentado alcanzó `41.68×` (`2.399%` de un núcleo), sin errores. LeakSanitizer no está disponible en la versión de macOS usada, por eso el crecimiento de memoria se comprueba con RSS durante el soak de reloj.

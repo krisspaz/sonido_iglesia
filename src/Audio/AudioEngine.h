@@ -5,6 +5,7 @@
 #include "Analysis/AnalysisEngine.h"
 #include "DSP/ProcessingEngine.h"
 #include "Smart/SmartEngine.h"
+#include "Match/ReferenceMatch.h"
 #include "Settings/AppSettings.h"
 #include "Groups/AutoGroupRouter.h"
 #include "Groups/GroupMixer.h"
@@ -49,10 +50,13 @@ public:
     ProcessingEngine& getProcessingEngine() noexcept { return processingEngine; }
     AnalysisEngine& getAnalysisEngine() noexcept { return analysisEngine; }
     SmartEngine& getSmartEngine() noexcept { return smartEngine; }
+    ReferenceMatchEngine& getReferenceMatchEngine() noexcept { return referenceMatchEngine; }
     [[nodiscard]] AutoRouteSnapshot getAutoRouteSnapshot() const noexcept { return autoGroupRouter.getSnapshot(); }
     [[nodiscard]] MaskingDecision getMaskingDecision() const noexcept { return groupMixer.getDecision(); }
     [[nodiscard]] bool isSmartMaskingEnabled() const noexcept { return groupMixer.isMaskingEnabled(); }
     void setSmartMaskingEnabled(bool shouldBeEnabled) noexcept { groupMixer.setMaskingEnabled(shouldBeEnabled); }
+    [[nodiscard]] bool isStemProcessingEnabled() const noexcept { return groupMixer.isStemProcessingEnabled(); }
+    void setStemProcessingEnabled(bool shouldBeEnabled) noexcept { groupMixer.setStemProcessingEnabled(shouldBeEnabled); }
 
     // Read-only console link. It only feeds naming hints and diagnostics; it
     // never sends anything that changes the X32.
@@ -87,6 +91,7 @@ private:
     ProcessingEngine processingEngine;
     AnalysisEngine analysisEngine;
     SmartEngine smartEngine;
+    ReferenceMatchEngine referenceMatchEngine { analysisEngine };
     AutoGroupRouter autoGroupRouter;
     GroupMixer groupMixer;
     X32Client x32Client;

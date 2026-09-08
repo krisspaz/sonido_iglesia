@@ -90,6 +90,7 @@ GroupFeatures GroupMixer::BandAnalyser::finish(int sampleCount) noexcept
 void GroupMixer::prepare(double newSampleRate) noexcept
 {
     sampleRate = std::max(8000.0, newSampleRate);
+    stems.prepare(sampleRate);
     voiceAnalyser.configure(sampleRate);
     musicAnalyser.configure(sampleRate);
     for (auto& gain : zoneGain)
@@ -102,6 +103,7 @@ void GroupMixer::prepare(double newSampleRate) noexcept
 
 void GroupMixer::reset() noexcept
 {
+    stems.reset();
     voiceAnalyser.reset();
     musicAnalyser.reset();
     masking.reset();
@@ -111,6 +113,17 @@ void GroupMixer::reset() noexcept
         gain.setCurrentAndTargetValue(0.0f);
     decision = {};
     publishDecision(decision);
+}
+
+void GroupMixer::setStemProcessingEnabled(bool shouldBeEnabled) noexcept
+{
+    stemProcessingEnabled.store(shouldBeEnabled, std::memory_order_release);
+    stems.setEnabled(shouldBeEnabled);
+}
+
+bool GroupMixer::isStemProcessingEnabled() const noexcept
+{
+    return stems.isEnabled();
 }
 
 bool GroupMixer::process(const float* const* inputs, int inputCount,
@@ -149,13 +162,27 @@ bool GroupMixer::process(const float* const* inputs, int inputCount,
 
     for (int sample = 0; sample < sampleCount; ++sample)
     {
-        const auto voiceMono = 0.5f * (voiceLeft[sample] + voiceRight[sample]);
-        const auto musicMonoRaw = 0.5f * (musicLeft[sample] + musicRight[sample]);
+        auto voiceL = voiceLeft[sample];
+        auto voiceR = voiceRight[sample];
+        auto musicL = musicLeft[sample];
+        auto musicR = musicRight[sample];
+        auto ambienceL = ambienceLeft[sample];
+        auto ambienceR = ambienceRight[sample];
+
+        // Per-stem chains run before the stems touch each other, and before the
+        // analysers see them, so the masker and the mix both work on what is
+        // actually heard.
+        stems.processSample(StemRole::voice, voiceL, voiceR);
+        stems.processSample(StemRole::music, musicL, musicR);
+        stems.processSample(StemRole::ambience, ambienceL, ambienceR);
+
+        const auto voiceMono = 0.5f * (voiceL + voiceR);
+        const auto musicMonoRaw = 0.5f * (musicL + musicR);
         voiceAnalyser.push(voiceMono);
         musicAnalyser.push(musicMonoRaw);
 
-        auto left = musicLeft[sample];
-        auto right = musicRight[sample];
+        auto left = musicL;
+        auto right = musicR;
         if (maskingOn)
             for (auto& filter : musicMaskFilters)
             {
@@ -165,8 +192,8 @@ bool GroupMixer::process(const float* const* inputs, int inputCount,
 
         // The ambience stem stays lower: voice and music keep their console
         // balance while the room microphones only add space.
-        outputs[0][sample] = voiceLeft[sample] + left + 0.35f * ambienceLeft[sample];
-        outputs[1][sample] = voiceRight[sample] + right + 0.35f * ambienceRight[sample];
+        outputs[0][sample] = voiceL + left + 0.35f * ambienceL;
+        outputs[1][sample] = voiceR + right + 0.35f * ambienceR;
     }
 
     for (auto& gain : zoneGain)

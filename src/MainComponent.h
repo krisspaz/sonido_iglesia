@@ -11,8 +11,11 @@
 #include "Safety/SafetyController.h"
 #include "Diagnostics/SessionDiagnostics.h"
 #include "UI/LevelMeter.h"
+#include "UI/QualityPanel.h"
 #include "UI/SpectrumComponent.h"
+#include "UI/X32Panel.h"
 #include "UI/Theme.h"
+#include "Analyst/ChurchSoundAnalystClient.h"
 
 #include <array>
 #include <juce_gui_extra/juce_gui_extra.h>
@@ -112,14 +115,17 @@ private:
     juce::TextButton autoTuneButton { "AUTO TUNE" };
     juce::TextButton abButton { "A/B : B" };
     juce::TextButton bypassButton { "BYPASS" };
+    juce::TextButton resetDspButton { "RESET DSP" };
 
     juce::Label measurementsTitle;
+    QualityPanel qualityPanel;
     std::array<juce::Label, 8> metricNames;
     std::array<juce::Label, 8> metricValues;
     juce::Label actionsTitle;
     juce::Label actionsLabel;
 
     juce::Label routingTitle;
+    X32Panel x32Panel;
     juce::Label inputLabel;
     juce::Label outputLabel;
     juce::ComboBox inputDevice;
@@ -129,6 +135,7 @@ private:
     juce::TextEditor obsPasswordEditor;
     juce::TextButton connectObsButton { "CONNECT OBS" };
     juce::TextButton offlineTestButton { "OFFLINE TEST" };
+    juce::TextButton analystButton { "ANALYZE PYTHON" };
     juce::ToggleButton startWithWindows { "START WITH WINDOWS" };
     juce::ToggleButton startMinimized { "START MINIMIZED" };
     juce::TextEditor churchNameEditor;
@@ -137,6 +144,7 @@ private:
     juce::Label latencyLabel;
     juce::Label diagnosticsLabel;
     std::unique_ptr<juce::FileChooser> offlineFileChooser;
+    std::unique_ptr<juce::FileChooser> analystFileChooser;
     std::unique_ptr<juce::FileChooser> roomFileChooser;
     std::unique_ptr<juce::AlertWindow> consoleAddressWindow;
     std::unique_ptr<juce::FileChooser> presetFileChooser;
@@ -145,6 +153,7 @@ private:
     std::array<juce::Rectangle<int>, 5> cardBounds;
     juce::StringArray inputDeviceNames;
     juce::StringArray outputDeviceNames;
+    ChurchSoundAnalystClient analystClient;
     bool suppressSelectionCallbacks = false;
     bool suppressDspCallbacks = false;
     bool deviceListsDirty = false;

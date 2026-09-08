@@ -261,7 +261,11 @@ void AnalysisEngine::analyseChunk(StreamState& state, SignalMetrics& metrics,
     double crossSum = 0.0;
     auto peak = 0.0f;
 
-    const auto envelopeRelease = std::exp(-1.0f / static_cast<float>(configuredSampleRate.load() * 0.100));
+    const auto rate = configuredSampleRate.load();
+    const auto envelopeRelease = std::exp(-1.0f / static_cast<float>(rate * 0.100));
+    // Five seconds: long enough that a single fill does not swing it, short
+    // enough that worship ending is visible while it is still happening.
+    const auto transientDecay = std::exp(-1.0f / static_cast<float>(rate * 5.0));
     for (int sample = 0; sample < numSamples; ++sample)
     {
         const auto l = left[sample];
@@ -277,20 +281,27 @@ void AnalysisEngine::analyseChunk(StreamState& state, SignalMetrics& metrics,
 
         const auto absolute = std::abs(mono);
         state.transientEnvelope = std::max(absolute, state.transientEnvelope * envelopeRelease);
+        state.transientRate *= transientDecay;
         if (state.transientCooldown > 0)
             --state.transientCooldown;
         else if (absolute > 0.02f && absolute > state.transientEnvelope * 0.92f
                  && absolute > std::abs(state.previousPeakSample) * 1.8f)
         {
-            ++state.transientCount;
-            state.transientCooldown = static_cast<int>(configuredSampleRate.load() * 0.020);
+            // Weighted so the steady state of this one-pole is the event rate
+            // in transients per second, whatever the sample rate.
+            state.transientRate += (1.0f - transientDecay) * static_cast<float>(rate);
+            state.transientCooldown = static_cast<int>(rate * 0.020);
         }
         state.previousPeakSample = mono;
-        ++state.transientSamples;
 
         state.fftInput[static_cast<size_t>(state.fftWritePosition)] = mono;
         state.fftWritePosition = (state.fftWritePosition + 1) & (fftSize - 1);
         ++state.fftSamplesSeen;
+        if (++state.hopCounter >= spectrumHop)
+        {
+            state.hopCounter = 0;
+            accumulateSpectrum(state);
+        }
     }
 
     const auto rms = static_cast<float>(std::sqrt(squareSum / static_cast<double>(numSamples)));
@@ -308,10 +319,7 @@ void AnalysisEngine::analyseChunk(StreamState& state, SignalMetrics& metrics,
     const auto midEnergy = std::max(1.0e-12, 0.5 * (leftSquare + rightSquare + 2.0 * crossSum));
     const auto sideEnergy = std::max(0.0, 0.5 * (leftSquare + rightSquare - 2.0 * crossSum));
     metrics.stereoWidth = std::clamp(static_cast<float>(std::sqrt(sideEnergy / midEnergy)), 0.0f, 2.0f);
-    const auto seconds = static_cast<double>(state.transientSamples) / configuredSampleRate.load();
-    metrics.transientDensity = seconds > 0.0
-        ? static_cast<float>(static_cast<double>(state.transientCount) / seconds)
-        : 0.0f;
+    metrics.transientDensity = state.transientRate;
 
     if (measureTruePeak)
         state.chunkTruePeak = std::max(state.chunkTruePeak, chunkTruePeak);
@@ -319,7 +327,7 @@ void AnalysisEngine::analyseChunk(StreamState& state, SignalMetrics& metrics,
     addLoudnessFrames(state, left, right, numSamples);
 }
 
-void AnalysisEngine::calculateSpectrum(StreamState& state, SignalMetrics& metrics)
+void AnalysisEngine::accumulateSpectrum(StreamState& state)
 {
     if (state.fftSamplesSeen < static_cast<uint64_t>(fftSize)) return;
     // fftWritePosition points to the oldest sample in the circular window.
@@ -330,7 +338,27 @@ void AnalysisEngine::calculateSpectrum(StreamState& state, SignalMetrics& metric
     window.multiplyWithWindowingTable(state.fftData.data(), fftSize);
     fft.performFrequencyOnlyForwardTransform(state.fftData.data());
 
+    for (int bin = 0; bin < spectrumBins; ++bin)
+    {
+        const auto magnitude = static_cast<double>(state.fftData[static_cast<size_t>(bin)])
+            / (fftSize * 0.5);
+        state.spectrumAccumulator[static_cast<size_t>(bin)] += magnitude * magnitude;
+    }
+    ++state.spectrumFrames;
+}
+
+void AnalysisEngine::calculateSpectrum(StreamState& state, SignalMetrics& metrics)
+{
+    // A chunk shorter than one hop produces no frame of its own. Rather than
+    // report nothing, take a single transform of the current window: it is the
+    // old behaviour, and it is only reached when there is too little new audio
+    // for averaging to have been possible anyway.
+    if (state.spectrumFrames == 0)
+        accumulateSpectrum(state);
+    if (state.spectrumFrames == 0) return;
+
     const auto rate = configuredSampleRate.load(std::memory_order_relaxed);
+    const auto scale = 1.0 / static_cast<double>(state.spectrumFrames);
     std::array<double, 5> energy {};
     double totalEnergy = 0.0;
     double weightedFrequency = 0.0;
@@ -338,10 +366,10 @@ void AnalysisEngine::calculateSpectrum(StreamState& state, SignalMetrics& metric
 
     for (int bin = 0; bin < spectrumBins; ++bin)
     {
-        const auto magnitude = state.fftData[static_cast<size_t>(bin)] / static_cast<float>(fftSize * 0.5);
-        metrics.spectrumDb[static_cast<size_t>(bin)] = gainToDb(magnitude);
+        const auto power = state.spectrumAccumulator[static_cast<size_t>(bin)] * scale;
+        const auto magnitude = std::sqrt(power);
+        metrics.spectrumDb[static_cast<size_t>(bin)] = gainToDb(static_cast<float>(magnitude));
         const auto frequency = static_cast<double>(bin) * rate / static_cast<double>(fftSize);
-        const auto power = static_cast<double>(magnitude) * magnitude;
         const auto band = frequency < 120.0 ? 0 : frequency < 500.0 ? 1 : frequency < 2500.0 ? 2
             : frequency < 8000.0 ? 3 : 4;
         energy[static_cast<size_t>(band)] += power;
@@ -351,12 +379,20 @@ void AnalysisEngine::calculateSpectrum(StreamState& state, SignalMetrics& metric
     }
 
     for (size_t band = 0; band < energy.size(); ++band)
+    {
         metrics.bandEnergy[band] = totalEnergy > 1.0e-18
             ? static_cast<float>(energy[band] / totalEnergy)
             : 0.0f;
+        metrics.bandLevelDb[band] = energy[band] > 1.0e-18
+            ? static_cast<float>(10.0 * std::log10(energy[band]))
+            : -100.0f;
+    }
     metrics.spectralCentroidHz = magnitudeSum > 1.0e-12
         ? static_cast<float>(weightedFrequency / magnitudeSum)
         : 0.0f;
+
+    state.spectrumAccumulator.fill(0.0);
+    state.spectrumFrames = 0;
 }
 
 void AnalysisEngine::addLoudnessFrames(StreamState& state, const float* left, const float* right,

@@ -39,6 +39,9 @@ public:
 private:
     static constexpr size_t fifoCapacity = 1U << 17;
     static constexpr int chunkCapacity = 8192;
+    // Half-window overlap, the usual Welch choice: with a Hann window it makes
+    // the averaged estimate use every sample with equal weight.
+    static constexpr int spectrumHop = fftSize / 2;
 
     struct StreamState
     {
@@ -49,8 +52,20 @@ private:
         float previousPeakSample = 0.0f;
         float transientEnvelope = 0.0f;
         int transientCooldown = 0;
-        uint64_t transientCount = 0;
-        uint64_t transientSamples = 0;
+        // Transients per second over a moving window. This used to be a
+        // lifetime average of two counters that were never reset: ten minutes
+        // into a service a new chunk moved it by hundredths of a percent, so it
+        // froze, and `classifyContext` reads it in five of its seven branches.
+        // The whole context classifier therefore stopped responding partway
+        // through every service.
+        float transientRate = 0.0f;
+        // Welch-averaged power spectrum. A single 2048-point periodogram has a
+        // variance equal to its own mean, and taking one per update discarded
+        // roughly two thirds of the audio as well. Every tonal decision is made
+        // on this, so the noise was going straight into the corrections.
+        std::array<double, spectrumBins> spectrumAccumulator {};
+        int spectrumFrames = 0;
+        int hopCounter = 0;
         float chunkTruePeak = 0.0f;
         TruePeakDetector truePeak;
         ebur128_state* loudness = nullptr;
@@ -62,6 +77,7 @@ private:
     void analyseChunk(StreamState& state, SignalMetrics& metrics,
                       const float* left, const float* right, int numSamples);
     void calculateSpectrum(StreamState& state, SignalMetrics& metrics);
+    void accumulateSpectrum(StreamState& state);
     void addLoudnessFrames(StreamState& state, const float* left, const float* right, int numSamples);
     static void updateLoudnessMetrics(StreamState& state, SignalMetrics& metrics, bool calculateTruePeak);
     static MixContext classifyContext(const SignalMetrics& metrics) noexcept;

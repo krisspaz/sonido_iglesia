@@ -37,6 +37,11 @@ private:
     struct Baseline
     {
         std::array<float, 5> bands { 0.12f, 0.24f, 0.35f, 0.23f, 0.06f };
+        // The same bands as absolute levels. Shares alone cannot tell a loud
+        // kick apart from a presence deficit, because one loud band lowers
+        // every other band's share at the same time.
+        std::array<float, 5> bandLevels { -100.0f, -100.0f, -100.0f, -100.0f, -100.0f };
+        bool levelsReady = false;
         float loudness = -14.0f;
         float crest = 10.0f;
         float centroid = 2200.0f;
@@ -48,6 +53,8 @@ private:
     struct Accumulator
     {
         std::array<double, 5> bands {};
+        std::array<double, 5> bandLevels {};
+        int levelCount = 0;
         double loudness = 0.0;
         double crest = 0.0;
         double centroid = 0.0;

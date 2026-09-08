@@ -74,6 +74,46 @@ public:
         a2 = static_cast<float>((1.0 - alpha) / a0);
     }
 
+    // RBJ shelving sections in the Q form. The Q form rather than the slope
+    // form because the BS.1770 K-weighting stage is specified as a shelf with
+    // Q = 0.7071752, and expressing it any other way means back-solving a
+    // slope that only reproduces the published coefficients approximately.
+    void setHighShelf(double sampleRate, float frequency, float q, float gainDb) noexcept
+    {
+        if (sampleRate <= 0.0)
+            return;
+
+        const auto amplitude = std::pow(10.0, static_cast<double>(gainDb) / 40.0);
+        const auto omega = 2.0 * std::numbers::pi * std::clamp(static_cast<double>(frequency), 10.0, sampleRate * 0.45) / sampleRate;
+        const auto cosine = std::cos(omega);
+        const auto alpha = std::sin(omega) / (2.0 * std::max(0.05, static_cast<double>(q)));
+        const auto root = 2.0 * std::sqrt(amplitude) * alpha;
+        const auto a0 = (amplitude + 1.0) - (amplitude - 1.0) * cosine + root;
+        b0 = static_cast<float>(amplitude * ((amplitude + 1.0) + (amplitude - 1.0) * cosine + root) / a0);
+        b1 = static_cast<float>(-2.0 * amplitude * ((amplitude - 1.0) + (amplitude + 1.0) * cosine) / a0);
+        b2 = static_cast<float>(amplitude * ((amplitude + 1.0) + (amplitude - 1.0) * cosine - root) / a0);
+        a1 = static_cast<float>(2.0 * ((amplitude - 1.0) - (amplitude + 1.0) * cosine) / a0);
+        a2 = static_cast<float>(((amplitude + 1.0) - (amplitude - 1.0) * cosine - root) / a0);
+    }
+
+    void setLowShelf(double sampleRate, float frequency, float q, float gainDb) noexcept
+    {
+        if (sampleRate <= 0.0)
+            return;
+
+        const auto amplitude = std::pow(10.0, static_cast<double>(gainDb) / 40.0);
+        const auto omega = 2.0 * std::numbers::pi * std::clamp(static_cast<double>(frequency), 10.0, sampleRate * 0.45) / sampleRate;
+        const auto cosine = std::cos(omega);
+        const auto alpha = std::sin(omega) / (2.0 * std::max(0.05, static_cast<double>(q)));
+        const auto root = 2.0 * std::sqrt(amplitude) * alpha;
+        const auto a0 = (amplitude + 1.0) + (amplitude - 1.0) * cosine + root;
+        b0 = static_cast<float>(amplitude * ((amplitude + 1.0) - (amplitude - 1.0) * cosine + root) / a0);
+        b1 = static_cast<float>(2.0 * amplitude * ((amplitude - 1.0) - (amplitude + 1.0) * cosine) / a0);
+        b2 = static_cast<float>(amplitude * ((amplitude + 1.0) - (amplitude - 1.0) * cosine - root) / a0);
+        a1 = static_cast<float>(-2.0 * ((amplitude - 1.0) + (amplitude + 1.0) * cosine) / a0);
+        a2 = static_cast<float>(((amplitude + 1.0) + (amplitude - 1.0) * cosine - root) / a0);
+    }
+
     void setPeak(double sampleRate, float frequency, float q, float gainDb) noexcept
     {
         if (sampleRate <= 0.0)

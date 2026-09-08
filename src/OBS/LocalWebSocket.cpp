@@ -14,10 +14,15 @@ LocalWebSocket::~LocalWebSocket() { stop(); }
 
 void LocalWebSocket::start(juce::String hostName, int portNumber)
 {
+    if (isThreadRunning())
+    {
+        signalThreadShouldExit();
+        closeSocket();
+        stopThread(2000);
+    }
     host = std::move(hostName);
     port = portNumber;
-    if (!isThreadRunning())
-        startThread(juce::Thread::Priority::low);
+    startThread(juce::Thread::Priority::low);
 }
 
 void LocalWebSocket::stop()
@@ -180,7 +185,7 @@ bool LocalWebSocket::readFrame(juce::MemoryBlock& payload, int& opcode, bool& fi
 
 bool LocalWebSocket::sendFrame(const void* data, size_t size, int opcode)
 {
-    if (!isConnected() && opcode != 0x1)
+    if (!isConnected())
         return false;
     juce::MemoryOutputStream frame;
     frame.writeByte(static_cast<char>(0x80 | (opcode & 0x0f)));

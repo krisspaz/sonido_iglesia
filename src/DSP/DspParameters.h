@@ -34,6 +34,11 @@ struct DspParameters final
     std::atomic<bool> adaptiveEqEnabled { true };
     std::atomic<bool> compressorEnabled { true };
     std::atomic<bool> saturationEnabled { true };
+    // Dynamic EQ and de-esser. Separate from the adaptive EQ because they work
+    // on completely different timescales: the Smart Engine decides tone over
+    // seconds, these two react inside a syllable.
+    std::atomic<bool> dynamicEqEnabled { true };
+    std::atomic<bool> deEsserEnabled { true };
     std::atomic<bool> limiterEnabled { true };
     // Stereo program leveler is enabled by the application setting. It is
     // separate from Smart Engine so it can safely stabilise a plain X32 L/R
@@ -75,6 +80,12 @@ struct DspMetrics final
     std::atomic<float> limiterGainReductionDb { 0.0f };
     std::atomic<float> truePeakEstimate { 0.0f };
     std::atomic<float> appliedOutputGainDb { 0.0f };
+    // What the dynamic sections are actually doing right now, so the operator
+    // can tell a de-esser that is working from one that is sitting on the whole
+    // top end.
+    std::atomic<float> deEsserReductionDb { 0.0f };
+    std::atomic<float> dynamicEqReductionDb { 0.0f };
+    std::atomic<float> compressorMakeupDb { 0.0f };
     std::atomic<float> broadcastLevelGainDb { 0.0f };
     std::atomic<float> abMatchGainDb { 0.0f };
     // Inter-channel correlation of the processed programme, and the width the

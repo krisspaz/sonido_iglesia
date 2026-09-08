@@ -2,6 +2,7 @@
 
 #include "DSP/Biquad.h"
 #include "SmartMaskingController.h"
+#include "StemProcessor.h"
 
 #include <array>
 #include <atomic>
@@ -34,6 +35,9 @@ public:
         return maskingEnabled.load(std::memory_order_acquire);
     }
 
+    void setStemProcessingEnabled(bool shouldBeEnabled) noexcept;
+    [[nodiscard]] bool isStemProcessingEnabled() const noexcept;
+
     // Returns false and touches nothing when the routes are not usable, so the
     // caller can fall back to the plain stereo path.
     bool process(const float* const* inputs, int inputCount,
@@ -59,6 +63,8 @@ private:
 
     double sampleRate = 48000.0;
     std::atomic<bool> maskingEnabled { false };
+    std::atomic<bool> stemProcessingEnabled { false };
+    StemProcessor stems;
     BandAnalyser voiceAnalyser;
     BandAnalyser musicAnalyser;
     SmartMaskingController masking;

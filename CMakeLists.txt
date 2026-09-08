@@ -50,6 +50,8 @@ target_sources(ChurchStreamProcessor PRIVATE
     src/Main.cpp
     src/MainComponent.cpp
     src/MainComponent.h
+    src/Match/ReferenceMatch.cpp
+    src/Match/ReferenceMatch.h
     src/OBS/LocalWebSocket.cpp
     src/OBS/LocalWebSocket.h
     src/OBS/OBSAuthentication.h
@@ -67,6 +69,8 @@ target_sources(ChurchStreamProcessor PRIVATE
     src/Analysis/StereoAudioFifo.h
     src/DSP/Biquad.h
     src/DSP/DspParameters.h
+    src/DSP/DynamicBand.h
+    src/DSP/KWeighting.h
     src/DSP/ProcessingEngine.cpp
     src/DSP/ProcessingEngine.h
     src/DSP/TruePeakDetector.h
@@ -95,6 +99,8 @@ target_sources(ChurchStreamProcessor PRIVATE
     src/Groups/AutoGroupRouter.h
     src/Groups/GroupMixer.cpp
     src/Groups/GroupMixer.h
+    src/Groups/StemProcessor.cpp
+    src/Groups/StemProcessor.h
     src/X32/OscMessage.h
     src/X32/X32Client.cpp
     src/X32/X32Client.h
@@ -102,12 +108,18 @@ target_sources(ChurchStreamProcessor PRIVATE
     src/Room/RoomCalibration.h
     src/UI/LevelMeter.cpp
     src/UI/LevelMeter.h
+    src/UI/QualityPanel.cpp
+    src/UI/QualityPanel.h
+    src/UI/X32Panel.cpp
+    src/UI/X32Panel.h
     src/UI/SpectrumComponent.cpp
     src/UI/SpectrumComponent.h
     src/UI/TrayController.cpp
     src/UI/TrayController.h
     src/UI/Theme.cpp
     src/UI/Theme.h
+    src/Analyst/ChurchSoundAnalystClient.cpp
+    src/Analyst/ChurchSoundAnalystClient.h
 )
 
 target_include_directories(ChurchStreamProcessor PRIVATE
@@ -166,6 +178,8 @@ if(BUILD_TESTING)
         src/Analysis/StereoAudioFifo.h
         src/DSP/Biquad.h
         src/DSP/DspParameters.h
+    src/DSP/DynamicBand.h
+    src/DSP/KWeighting.h
         src/DSP/ProcessingEngine.cpp
         src/DSP/ProcessingEngine.h
         src/DSP/TruePeakDetector.h
@@ -174,6 +188,8 @@ if(BUILD_TESTING)
         src/Smart/SmartTypes.h
         src/Offline/OfflineProcessor.cpp
         src/Offline/OfflineProcessor.h
+        src/Match/ReferenceMatch.cpp
+        src/Match/ReferenceMatch.h
         src/OBS/OBSAuthentication.h
         src/Audio/AudioRouting.h
         src/Audio/MeterSource.h
@@ -185,6 +201,8 @@ if(BUILD_TESTING)
         src/Groups/AutoGroupRouter.h
         src/Groups/GroupMixer.cpp
         src/Groups/GroupMixer.h
+        src/Groups/StemProcessor.cpp
+        src/Groups/StemProcessor.h
         src/X32/OscMessage.h
         src/X32/X32Client.cpp
         src/X32/X32Client.h
@@ -227,6 +245,8 @@ if(BUILD_TESTING)
         tests/ProcessingBenchmark.cpp
         src/DSP/Biquad.h
         src/DSP/DspParameters.h
+    src/DSP/DynamicBand.h
+    src/DSP/KWeighting.h
         src/DSP/ProcessingEngine.cpp
         src/DSP/ProcessingEngine.h
         src/DSP/TruePeakDetector.h

@@ -24,6 +24,7 @@ juce::String AudioEngine::initialise()
     auto error = deviceManager.initialise(8, 2, savedState.get(), true);
     deviceManager.addAudioCallback(this);
     smartEngine.start();
+    referenceMatchEngine.start();
     initialised = true;
 
     // A stale/default Windows device state must never prevent X32 discovery.
@@ -50,10 +51,11 @@ void AudioEngine::shutdown()
         return;
 
     rememberCurrentSetup();
-    smartEngine.stop();
-    analysisEngine.stop();
     deviceManager.removeAudioCallback(this);
     deviceManager.closeAudioDevice();
+    smartEngine.stop();
+    referenceMatchEngine.stop();
+    analysisEngine.stop();
     settings.flush();
     initialised = false;
 }

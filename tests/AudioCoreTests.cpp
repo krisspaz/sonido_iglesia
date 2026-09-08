@@ -11,6 +11,8 @@
 #include "Groups/AutoGroupRouter.h"
 #include "DSP/TruePeakDetector.h"
 #include "Groups/GroupMixer.h"
+#include "Groups/StemProcessor.h"
+#include "Match/ReferenceMatch.h"
 #include "X32/X32Client.h"
 #include "Room/RoomCalibration.h"
 
@@ -51,6 +53,25 @@ void expect(bool condition, const char* message)
 bool approximately(float actual, float expected, float tolerance = 1.0e-5f)
 {
     return std::abs(actual - expected) <= tolerance;
+}
+
+// Single-bin magnitude of a sine tone, phase-independent. The window must hold
+// an exact integer number of cycles at `frequencyHz` for the bin to be isolated;
+// the caller chooses a window length that makes `frequencyHz * window / sampleRate`
+// an integer.
+double goertzel(const std::vector<float>& samples, double frequencyHz, double sampleRate)
+{
+    const auto omega = 2.0 * 3.14159265358979323846 * frequencyHz / sampleRate;
+    const auto coefficient = 2.0 * std::cos(omega);
+    double previous = 0.0;
+    double previous2 = 0.0;
+    for (const auto sample : samples)
+    {
+        const auto current = static_cast<double>(sample) + coefficient * previous - previous2;
+        previous2 = previous;
+        previous = current;
+    }
+    return std::sqrt(previous * previous + previous2 * previous2 - coefficient * previous * previous2);
 }
 
 CSP_TEST_CASE void testStereoPassthrough()
@@ -189,6 +210,184 @@ CSP_TEST_CASE void testFourBandRecombinationIsLevelNeutral()
     const auto rms = static_cast<float>(std::sqrt(squareSum / blockSize));
     expect(approximately(rms, 0.2f / std::sqrt(2.0f), 0.004f),
            "four-band crossover must recombine with level-neutral magnitude");
+}
+
+CSP_TEST_CASE void testOversampledSaturationKeepsRoutesSampleAligned()
+{
+    constexpr int blockSize = 256;
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockCount = 48;
+    churchstream::ProcessingEngine engine;
+    engine.prepare(sampleRate, blockSize, 2);
+    auto& parameters = engine.getParameters();
+    parameters.smartProcessing.store(false);
+    parameters.rumbleEnabled.store(false);
+    parameters.adaptiveEqEnabled.store(false);
+    parameters.compressorEnabled.store(false);
+    parameters.saturationEnabled.store(true);
+    parameters.limiterEnabled.store(false);
+    parameters.broadcastLevelerEnabled.store(false);
+    parameters.monoCompatibilityEnabled.store(false);
+    parameters.phaseCoherenceEnabled.store(false);
+    parameters.warmth.store(1.0f);
+
+    std::vector<float> left(static_cast<size_t>(blockSize * blockCount));
+    std::vector<float> right(left.size());
+    std::vector<float> input(left.size());
+    float* channels[] { left.data(), right.data() };
+
+    double phase = 0.0;
+    const auto phaseStep = 2.0 * 3.14159265358979323846 * 2000.0 / sampleRate;
+    for (int sample = 0; sample < blockSize * blockCount; ++sample)
+    {
+        input[static_cast<size_t>(sample)] = 0.25f * static_cast<float>(std::sin(phase));
+        phase += phaseStep;
+    }
+    for (int block = 0; block < blockCount; ++block)
+    {
+        std::copy(input.begin() + block * blockSize,
+                  input.begin() + (block + 1) * blockSize,
+                  right.begin() + block * blockSize);
+        std::copy(input.begin() + block * blockSize,
+                  input.begin() + (block + 1) * blockSize,
+                  left.begin() + block * blockSize);
+        engine.process(channels, 2, blockSize);
+    }
+
+    const auto latency = engine.getLatencySamples();
+    expect(latency > churchstream::TruePeakDetector::latencySamples * 2,
+           "reported latency must stay above the true-peak lookahead floor");
+
+    // Cross-correlate the output against the input at lags around the reported
+    // latency. In a correctly aligned engine the wet and dry routes both leave
+    // one `getLatencySamples()` after their input sample arrived.
+    constexpr int search = 6;
+    auto bestLag = 0;
+    auto bestCorrelation = -1.0;
+    for (int lag = latency - search; lag <= latency + search; ++lag)
+    {
+        double correlation = 0.0;
+        for (int sample = latency + search; sample < blockSize * blockCount - search; ++sample)
+            correlation += static_cast<double>(left[static_cast<size_t>(sample)])
+                * input[static_cast<size_t>(sample - lag)];
+        if (correlation > bestCorrelation)
+        {
+            bestCorrelation = correlation;
+            bestLag = lag;
+        }
+    }
+    expect(std::abs(bestLag - latency) <= 2,
+           "wet route must be sample aligned with the reported latency");
+}
+
+CSP_TEST_CASE void testOversampledSaturationRemovesHighHarmonics()
+{
+    // A 9 kHz tone on the full-band saturator produces odd harmonics at 27 kHz
+    // (third) and 45 kHz (fifth), both above 24 kHz Nyquist. Saturating at 1x
+    // folds those back down to 21 kHz and 3 kHz as inharmonic aliasing; the 4x
+    // oversampler generates them at 192 kHz so its decimation filter removes
+    // them instead of folding them. The bins are exact because the window holds
+    // an integer number of cycles at 3, 9 and 21 kHz.
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 512;
+    constexpr int windowSamples = 4800;
+    constexpr int blockCount = windowSamples / blockSize + 6;
+    churchstream::ProcessingEngine engine;
+    engine.prepare(sampleRate, blockSize, 2);
+    auto& parameters = engine.getParameters();
+    parameters.smartProcessing.store(false);
+    parameters.rumbleEnabled.store(false);
+    parameters.adaptiveEqEnabled.store(false);
+    parameters.compressorEnabled.store(false);
+    parameters.saturationEnabled.store(true);
+    parameters.limiterEnabled.store(false);
+    parameters.broadcastLevelerEnabled.store(false);
+    parameters.monoCompatibilityEnabled.store(false);
+    parameters.phaseCoherenceEnabled.store(false);
+    parameters.warmth.store(1.0f);
+
+    std::vector<float> left(static_cast<size_t>(blockSize * blockCount));
+    std::vector<float> right(left.size());
+    float* channels[] { left.data(), right.data() };
+    double phase = 0.0;
+    const auto phaseStep = 2.0 * 3.14159265358979323846 * 9000.0 / sampleRate;
+    for (int block = 0; block < blockCount; ++block)
+    {
+        for (int sample = 0; sample < blockSize; ++sample)
+        {
+            const auto value = 0.35f * static_cast<float>(std::sin(phase));
+            left[static_cast<size_t>(block * blockSize + sample)] = value;
+            right[static_cast<size_t>(block * blockSize + sample)] = value;
+            phase += phaseStep;
+        }
+        engine.process(channels, 2, blockSize);
+    }
+
+    const auto outputStart = static_cast<size_t>((blockCount * blockSize) - windowSamples);
+    const std::vector<float> window(left.begin() + static_cast<std::ptrdiff_t>(outputStart), left.end());
+    const auto fundamentalDb = 20.0 * std::log10(goertzel(window, 9000.0, sampleRate));
+    const auto foldedThirdDb = 20.0 * std::log10(goertzel(window, 21000.0, sampleRate));
+    const auto foldedFifthDb = 20.0 * std::log10(goertzel(window, 3000.0, sampleRate));
+    expect(fundamentalDb > -30.0, "9 kHz fundamental must pass through the full-band saturator");
+    expect(foldedThirdDb < fundamentalDb - 25.0,
+           "3rd harmonic must be removed by the oversampler instead of folded to 21 kHz");
+    expect(foldedFifthDb < fundamentalDb - 40.0,
+           "5th harmonic must be removed by the oversampler instead of folded to 3 kHz");
+}
+
+CSP_TEST_CASE void testSaturationStillDistortsAboveTheOldSplitFrequency()
+{
+    // The pre-oversampling saturation ran on bands below 4 kHz only. Now that
+    // the whole wet path saturates, a 1 kHz tone should still reach its third
+    // harmonic with real (non-aliased) energy, and an even harmonic must not
+    // appear because the tanh is an odd function.
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 512;
+    constexpr int windowSamples = 4800;
+    constexpr int blockCount = windowSamples / blockSize + 6;
+    churchstream::ProcessingEngine engine;
+    engine.prepare(sampleRate, blockSize, 2);
+    auto& parameters = engine.getParameters();
+    parameters.smartProcessing.store(false);
+    parameters.rumbleEnabled.store(false);
+    parameters.adaptiveEqEnabled.store(false);
+    parameters.compressorEnabled.store(false);
+    parameters.saturationEnabled.store(true);
+    parameters.limiterEnabled.store(false);
+    parameters.broadcastLevelerEnabled.store(false);
+    parameters.monoCompatibilityEnabled.store(false);
+    parameters.phaseCoherenceEnabled.store(false);
+    parameters.warmth.store(1.0f);
+
+    std::vector<float> left(static_cast<size_t>(blockSize * blockCount));
+    std::vector<float> right(left.size());
+    float* channels[] { left.data(), right.data() };
+    double phase = 0.0;
+    const auto phaseStep = 2.0 * 3.14159265358979323846 * 1000.0 / sampleRate;
+    for (int block = 0; block < blockCount; ++block)
+    {
+        for (int sample = 0; sample < blockSize; ++sample)
+        {
+            const auto value = 0.35f * static_cast<float>(std::sin(phase));
+            left[static_cast<size_t>(block * blockSize + sample)] = value;
+            right[static_cast<size_t>(block * blockSize + sample)] = value;
+            phase += phaseStep;
+        }
+        engine.process(channels, 2, blockSize);
+    }
+
+    const auto outputStart = static_cast<size_t>((blockCount * blockSize) - windowSamples);
+    const std::vector<float> window(left.begin() + static_cast<std::ptrdiff_t>(outputStart), left.end());
+    const auto fundamental = goertzel(window, 1000.0, sampleRate);
+    const auto third = goertzel(window, 3000.0, sampleRate);
+    const auto second = goertzel(window, 2000.0, sampleRate);
+    const auto fundamentalDb = 20.0 * std::log10(fundamental);
+    const auto thirdDb = 20.0 * std::log10(third);
+    const auto secondDb = 20.0 * std::log10(second);
+    expect(thirdDb > fundamentalDb - 40.0,
+           "third harmonic must be present below 4 kHz after the full-band saturator");
+    expect(secondDb < fundamentalDb - 50.0,
+           "an odd saturator must not produce a second harmonic");
 }
 
 CSP_TEST_CASE void testSampleRatesBuffersAndLiveChanges()
@@ -374,6 +573,46 @@ CSP_TEST_CASE void testSmartQualityClosedLoopAndRollback()
     state = smart.getState();
     expect(state.rollbackCount > 0,
            "closed-loop evaluation must rollback when severity and mix score deteriorate");
+}
+
+CSP_TEST_CASE void testResetAdaptiveCorrections()
+{
+    // Mirrors the RESET DSP action: persistent corrective state must be
+    // pushed back to neutral so the operator can start from a clean slate.
+    churchstream::AnalysisEngine analysis;
+    churchstream::ProcessingEngine processing;
+    processing.prepare(48000.0, 256, 2);
+    churchstream::SmartEngine smart(analysis, processing);
+
+    churchstream::AnalysisSnapshot snapshot;
+    snapshot.sampleRate = 48000.0;
+    snapshot.processed.rmsDb = -18.0f;
+    snapshot.processed.lufsShortTerm = -14.0f;
+    snapshot.processed.crestFactorDb = 10.0f;
+    snapshot.processed.stereoCorrelation = 0.8f;
+    snapshot.processed.bandEnergy = { 0.05f, 0.78f, 0.08f, 0.06f, 0.03f };
+    for (int update = 0; update < 80; ++update)
+        smart.processSnapshotForTesting(snapshot, 0.1f);
+
+    auto& adaptive = processing.getAdaptiveTargets();
+    expect(adaptive.lowGainDb.load() < -0.05f || adaptive.mudGainDb.load() < -0.05f,
+           "the fixture must first drive a measurable corrective reduction");
+
+    adaptive.rumbleCutoffHz.store(20.0f, std::memory_order_release);
+    adaptive.lowGainDb.store(0.0f, std::memory_order_release);
+    adaptive.mudGainDb.store(0.0f, std::memory_order_release);
+    adaptive.clarityGainDb.store(0.0f, std::memory_order_release);
+    adaptive.harshGainDb.store(0.0f, std::memory_order_release);
+    adaptive.sibilanceGainDb.store(0.0f, std::memory_order_release);
+    adaptive.highGainDb.store(0.0f, std::memory_order_release);
+    adaptive.compressionDb.store(0.0f, std::memory_order_release);
+    adaptive.loudnessGainDb.store(0.0f, std::memory_order_release);
+    adaptive.stereoWidth.store(1.0f, std::memory_order_release);
+    adaptive.stereoBalanceDb.store(0.0f, std::memory_order_release);
+
+    expect(adaptive.lowGainDb.load() == 0.0f && adaptive.mudGainDb.load() == 0.0f
+               && adaptive.loudnessGainDb.load() == 0.0f && adaptive.stereoWidth.load() == 1.0f,
+           "RESET DSP must clear every adaptive correction back to neutral");
 }
 
 CSP_TEST_CASE void testSafetyControllerAndSmartMasking()
@@ -1778,6 +2017,344 @@ CSP_TEST_CASE void testGroupMixerFallbackAndMasking()
     }
 }
 
+CSP_TEST_CASE void testStemProcessorIdentityWhenDisabled()
+{
+    constexpr int sampleRate = 48000;
+    churchstream::StemProcessor stems;
+    stems.prepare(sampleRate);
+
+    expect(!stems.isEnabled(), "stem processing must start disabled on a live service");
+    expect(approximately(stems.getAppliedGainDb(churchstream::StemRole::voice), 0.0f, 1.0e-6f),
+           "no dynamics may report gain while the chains are disabled");
+
+    std::vector<float> left(static_cast<size_t>(sampleRate));
+    std::vector<float> right(static_cast<size_t>(sampleRate));
+    auto phase = 0.0f;
+    for (int sample = 0; sample < sampleRate; ++sample)
+    {
+        phase += 2.0f * juce::MathConstants<float>::pi * 900.0f / static_cast<float>(sampleRate);
+        left[static_cast<size_t>(sample)] = 0.8f * std::sin(phase);
+        right[static_cast<size_t>(sample)] = 0.5f * std::cos(phase * 0.7f);
+    }
+    auto leftCopy = left;
+    auto rightCopy = right;
+    for (int sample = 0; sample < sampleRate; ++sample)
+        stems.processSample(churchstream::StemRole::voice, leftCopy[static_cast<size_t>(sample)],
+                            rightCopy[static_cast<size_t>(sample)]);
+    expect(leftCopy == left && rightCopy == right,
+           "disabled stem processing must be a bit-exact passthrough");
+}
+
+CSP_TEST_CASE void testStemVoiceChainRemovesRumbleAndTamesSibilance()
+{
+    constexpr int sampleRate = 48000;
+    constexpr int length = sampleRate * 2;
+    std::vector<float> input(static_cast<size_t>(length));
+    std::vector<float> leftOut(static_cast<size_t>(length));
+    std::vector<float> rightOut(static_cast<size_t>(length));
+
+    churchstream::StemProcessor stems;
+    stems.prepare(sampleRate);
+    stems.setEnabled(true);
+
+    const auto rmsDbOf = [&](const std::vector<float>& left, const std::vector<float>& right, int from)
+    {
+        double sum = 0.0;
+        double count = 0.0;
+        for (int sample = from; sample < length; ++sample)
+        {
+            sum += static_cast<double>(left[static_cast<size_t>(sample)]) * left[static_cast<size_t>(sample)]
+                + static_cast<double>(right[static_cast<size_t>(sample)]) * right[static_cast<size_t>(sample)];
+            count += 2.0;
+        }
+        const auto rms = std::sqrt(sum / count);
+        return rms > 1.0e-7 ? static_cast<float>(20.0 * std::log10(rms)) : -140.0f;
+    };
+
+    // 25 Hz rumble sits far below the 80 Hz HP corner and must drop hard.
+    auto phase = 0.0f;
+    for (int sample = 0; sample < length; ++sample)
+    {
+        phase += 2.0f * juce::MathConstants<float>::pi * 25.0f / static_cast<float>(sampleRate);
+        input[static_cast<size_t>(sample)] = 0.5f * std::sin(phase);
+    }
+    for (int sample = 0; sample < length; ++sample)
+    {
+        leftOut[static_cast<size_t>(sample)] = input[static_cast<size_t>(sample)];
+        rightOut[static_cast<size_t>(sample)] = input[static_cast<size_t>(sample)];
+        stems.processSample(churchstream::StemRole::voice, leftOut[static_cast<size_t>(sample)],
+                            rightOut[static_cast<size_t>(sample)]);
+    }
+    const auto inDb = rmsDbOf(input, input, length / 2);
+    const auto outRumbleDb = rmsDbOf(leftOut, rightOut, length / 2);
+    expect(inDb - outRumbleDb > 12.0f,
+           "the voice HP must remove subsonic rumble from the near mics");
+
+    // A 5 kHz tone: presence shelf boost wins and the quiet de-esser never
+    // triggers, so the voice must come out clearly louder than it went in.
+    phase = 0.0f;
+    for (int sample = 0; sample < length; ++sample)
+    {
+        phase += 2.0f * juce::MathConstants<float>::pi * 5000.0f / static_cast<float>(sampleRate);
+        input[static_cast<size_t>(sample)] = 0.02f * std::sin(phase);
+    }
+    for (int sample = 0; sample < length; ++sample)
+    {
+        leftOut[static_cast<size_t>(sample)] = input[static_cast<size_t>(sample)];
+        rightOut[static_cast<size_t>(sample)] = input[static_cast<size_t>(sample)];
+        stems.processSample(churchstream::StemRole::voice, leftOut[static_cast<size_t>(sample)],
+                            rightOut[static_cast<size_t>(sample)]);
+    }
+    const auto inPresenceDb = rmsDbOf(input, input, length / 2);
+    const auto outPresenceDb = rmsDbOf(leftOut, rightOut, length / 2);
+    expect(outPresenceDb - inPresenceDb > 1.5f && outPresenceDb - inPresenceDb < 7.0f,
+           "the presence shelf must boost the voice range without blasting it");
+
+    // Loud, sustained sibilance must be ducked harder than a plain speech-band
+    // tone of the same level: that is the de-esser telling "sss" from "aah".
+    auto sibRmsIn = 0.0;
+    auto speechRmsIn = 0.0;
+    auto sibRmsOut = 0.0;
+    auto speechRmsOut = 0.0;
+    phase = 0.0f;
+    for (int sample = length / 2; sample < length; ++sample)
+    {
+        phase += 2.0f * juce::MathConstants<float>::pi * 6500.0f / static_cast<float>(sampleRate);
+        const auto value = 0.3f * std::sin(phase);
+        input[static_cast<size_t>(sample)] = value;
+        leftOut[static_cast<size_t>(sample)] = value;
+        rightOut[static_cast<size_t>(sample)] = value;
+    }
+    for (int sample = length / 2; sample < length; ++sample)
+    {
+        stems.processSample(churchstream::StemRole::voice, leftOut[static_cast<size_t>(sample)],
+                            rightOut[static_cast<size_t>(sample)]);
+        sibRmsIn += static_cast<double>(input[static_cast<size_t>(sample)])
+            * input[static_cast<size_t>(sample)];
+        sibRmsOut += static_cast<double>(leftOut[static_cast<size_t>(sample)])
+            * leftOut[static_cast<size_t>(sample)];
+    }
+    phase = 0.0f;
+    for (int sample = length / 2; sample < length; ++sample)
+    {
+        phase += 2.0f * juce::MathConstants<float>::pi * 3000.0f / static_cast<float>(sampleRate);
+        const auto value = 0.3f * std::sin(phase);
+        input[static_cast<size_t>(sample)] = value;
+        leftOut[static_cast<size_t>(sample)] = value;
+        rightOut[static_cast<size_t>(sample)] = value;
+    }
+    for (int sample = length / 2; sample < length; ++sample)
+    {
+        stems.processSample(churchstream::StemRole::voice, leftOut[static_cast<size_t>(sample)],
+                            rightOut[static_cast<size_t>(sample)]);
+        speechRmsIn += static_cast<double>(input[static_cast<size_t>(sample)])
+            * input[static_cast<size_t>(sample)];
+        speechRmsOut += static_cast<double>(leftOut[static_cast<size_t>(sample)])
+            * leftOut[static_cast<size_t>(sample)];
+    }
+    // Both tones come in at the same amplitude, so after the chains the
+    // sibilance must have clearly lost more level than the plain speech band.
+    const auto sibReduction = speechRmsIn > 0.0 ? std::log10(speechRmsIn / sibRmsIn) : 0.0;
+    const auto sibOutReduction = speechRmsOut > 0.0 ? std::log10(speechRmsOut / sibRmsOut) : 0.0;
+    expect(sibOutReduction - sibReduction > 0.05,
+           "sustained sibilance must lose level relative to a speech-band tone of the same amplitude");
+    const auto ducker = stems.getAppliedGainDb(churchstream::StemRole::voice);
+    expect(ducker < 0.0f, "the voice compressor must report the gain it is applying");
+}
+
+CSP_TEST_CASE void testStemMusicAndAmbienceChains()
+{
+    constexpr int sampleRate = 48000;
+    constexpr int length = sampleRate * 2;
+    constexpr int measureFrom = sampleRate;
+    std::vector<float> input(static_cast<size_t>(length));
+    std::vector<float> leftOut(static_cast<size_t>(length));
+    std::vector<float> rightOut(static_cast<size_t>(length));
+
+    auto phase = 0.0f;
+    const auto tone = [&](float frequency)
+    {
+        phase += 2.0f * juce::MathConstants<float>::pi * frequency / static_cast<float>(sampleRate);
+        return 0.02f * std::sin(phase);
+    };
+
+    const auto rmsDbOf = [&]()
+    {
+        double sum = 0.0;
+        double count = 0.0;
+        for (int sample = measureFrom; sample < length; ++sample)
+        {
+            sum += static_cast<double>(leftOut[static_cast<size_t>(sample)]) * leftOut[static_cast<size_t>(sample)]
+                + static_cast<double>(rightOut[static_cast<size_t>(sample)]) * rightOut[static_cast<size_t>(sample)];
+            count += 2.0;
+        }
+        const auto rms = std::sqrt(sum / count);
+        return rms > 1.0e-7 ? static_cast<float>(20.0 * std::log10(rms)) : -140.0f;
+    };
+
+    churchstream::StemProcessor stems;
+    stems.prepare(sampleRate);
+    stems.setEnabled(true);
+
+    // Music: 25 Hz below the 40 Hz corner must be cut hard.
+    for (int sample = 0; sample < measureFrom; ++sample) tone(25.0f);
+    for (int sample = 0; sample < length; ++sample)
+    {
+        const auto value = tone(25.0f);
+        input[static_cast<size_t>(sample)] = value;
+        leftOut[static_cast<size_t>(sample)] = value;
+        rightOut[static_cast<size_t>(sample)] = value;
+    }
+    for (int sample = 0; sample < length; ++sample)
+        stems.processSample(churchstream::StemRole::music, leftOut[static_cast<size_t>(sample)],
+                            rightOut[static_cast<size_t>(sample)]);
+    auto inMusicDb = -140.0f;
+    {
+        double sum = 0.0;
+        double count = 0.0;
+        for (int sample = measureFrom; sample < length; ++sample)
+        {
+            sum += static_cast<double>(input[static_cast<size_t>(sample)]) * input[static_cast<size_t>(sample)] * 2.0;
+            count += 2.0;
+        }
+        const auto rms = std::sqrt(sum / count);
+        inMusicDb = rms > 1.0e-7 ? static_cast<float>(20.0 * std::log10(rms)) : -140.0f;
+    }
+    expect(inMusicDb - rmsDbOf() > 6.0f,
+           "the music HP must cut the subsonic band below the speaker range");
+
+    // Music: a quiet beat passes, only getting the chain untouched.
+    phase = 0.0f;
+    for (int sample = 0; sample < length; ++sample)
+    {
+        const auto value = tone(1000.0f);
+        input[static_cast<size_t>(sample)] = value;
+        leftOut[static_cast<size_t>(sample)] = value;
+        rightOut[static_cast<size_t>(sample)] = value;
+    }
+    for (int sample = 0; sample < length; ++sample)
+        stems.processSample(churchstream::StemRole::music, leftOut[static_cast<size_t>(sample)],
+                            rightOut[static_cast<size_t>(sample)]);
+    auto inMusic1kDb = -140.0f;
+    {
+        double sum = 0.0;
+        double count = 0.0;
+        for (int sample = measureFrom; sample < length; ++sample)
+        {
+            sum += static_cast<double>(input[static_cast<size_t>(sample)]) * input[static_cast<size_t>(sample)] * 2.0;
+            count += 2.0;
+        }
+        const auto rms = std::sqrt(sum / count);
+        inMusic1kDb = rms > 1.0e-7 ? static_cast<float>(20.0 * std::log10(rms)) : -140.0f;
+    }
+    expect(std::abs(inMusic1kDb - rmsDbOf()) < 1.0f,
+           "a quiet music passage must pass with negligible level change");
+    const auto musicDucker = stems.getAppliedGainDb(churchstream::StemRole::music);
+    expect(approximately(musicDucker, 0.0f, 0.5f),
+           "an inaudible music passage must not pull the compressor");
+
+    // Ambience: loud room into silence. The gate must fall to its floor.
+    phase = 0.0f;
+    for (int sample = 0; sample < sampleRate / 2; ++sample)
+    {
+        const auto value = 0.3f * std::sin(2.0f * juce::MathConstants<float>::pi
+            * 1000.0f * static_cast<float>(sample) / static_cast<float>(sampleRate));
+        input[static_cast<size_t>(sample)] = value;
+        leftOut[static_cast<size_t>(sample)] = value;
+        rightOut[static_cast<size_t>(sample)] = value;
+    }
+    for (int sample = sampleRate / 2; sample < length; ++sample)
+    {
+        input[static_cast<size_t>(sample)] = 0.0f;
+        leftOut[static_cast<size_t>(sample)] = 0.0f;
+        rightOut[static_cast<size_t>(sample)] = 0.0f;
+    }
+    const auto gateOpeningDb = [&]()
+    {
+        double sum = 0.0;
+        double count = 0.0;
+        for (int sample = 0; sample < sampleRate / 2; ++sample)
+        {
+            sum += static_cast<double>(leftOut[static_cast<size_t>(sample)]) * leftOut[static_cast<size_t>(sample)] * 2.0;
+            count += 2.0;
+        }
+        const auto rms = std::sqrt(sum / count);
+        return rms > 1.0e-7 ? static_cast<float>(20.0 * std::log10(rms)) : -140.0f;
+    };
+    const auto beforeGate = gateOpeningDb();
+    for (int sample = 0; sample < length; ++sample)
+        stems.processSample(churchstream::StemRole::ambience, leftOut[static_cast<size_t>(sample)],
+                            rightOut[static_cast<size_t>(sample)]);
+    expect(beforeGate - gateOpeningDb() < 0.5f,
+           "the ambience tone must pass while the gate is open");
+    expect(rmsDbOf() < -50.0f,
+           "the ambience gate must fall to its floor when the room goes silent");
+    expect(stems.getAppliedGainDb(churchstream::StemRole::ambience) < -40.0f,
+           "the ambience gate must report that it is closed");
+}
+
+CSP_TEST_CASE void testStemProcessingInsideGroupMixer()
+{
+    constexpr int sampleRate = 48000;
+    constexpr int blockSize = 512;
+    auto mixer = std::make_unique<churchstream::GroupMixer>();
+    mixer->prepare(sampleRate);
+
+    std::vector<std::vector<float>> inputStorage(6, std::vector<float>(blockSize, 0.0f));
+    std::vector<std::vector<float>> outputStorage(2, std::vector<float>(blockSize, 0.0f));
+    std::array<const float*, 6> inputs {};
+    std::array<float*, 2> outputs {};
+    for (int channel = 0; channel < 6; ++channel) inputs[static_cast<size_t>(channel)] = inputStorage[static_cast<size_t>(channel)].data();
+    for (int channel = 0; channel < 2; ++channel) outputs[static_cast<size_t>(channel)] = outputStorage[static_cast<size_t>(channel)].data();
+
+    churchstream::GroupRoutingConfig routes;
+    int phase = 0;
+    const auto fill = [&]()
+    {
+        for (int sample = 0; sample < blockSize; ++sample)
+        {
+            const auto position = static_cast<float>(phase + sample);
+            // A preached half-second drum roll ending in a loud rumble:
+            // voice carries 55 Hz, music a 40 Hz floor, and tiny room mics.
+            const auto voice = 0.45f * std::sin(position * 2.0f * juce::MathConstants<float>::pi * 55.0f / sampleRate);
+            const auto music = 0.30f * std::sin(position * 2.0f * juce::MathConstants<float>::pi * 45.0f / sampleRate);
+            inputStorage[0][static_cast<size_t>(sample)] = voice;
+            inputStorage[1][static_cast<size_t>(sample)] = voice;
+            inputStorage[2][static_cast<size_t>(sample)] = music;
+            inputStorage[3][static_cast<size_t>(sample)] = music;
+            inputStorage[4][static_cast<size_t>(sample)] = 0.0f;
+            inputStorage[5][static_cast<size_t>(sample)] = 0.0f;
+        }
+        phase += blockSize;
+    };
+
+    const auto blocks = sampleRate * 4 / blockSize;
+    const auto render = [&]()
+    {
+        for (int block = 0; block < blocks; ++block)
+        {
+            fill();
+            expect(mixer->process(inputs.data(), 6, outputs.data(), 2, blockSize, routes),
+                   "valid stems must keep mixing while stem processing toggles");
+        }
+        double sum = 0.0;
+        for (int block = 0; block < blockSize; ++block)
+            sum += static_cast<double>(outputStorage[0][static_cast<size_t>(block)]) * outputStorage[0][static_cast<size_t>(block)];
+        const auto rms = std::sqrt(sum / static_cast<double>(blockSize));
+        return rms > 1.0e-7 ? static_cast<float>(20.0 * std::log10(rms)) : -140.0f;
+    };
+
+    const auto untouchedRms = render();
+    expect(!mixer->isStemProcessingEnabled(),
+           "stem processing must not be enabled before the operator asks for it");
+
+    mixer->setStemProcessingEnabled(true);
+    expect(mixer->isStemProcessingEnabled(), "the mixer must expose the stem processing flag");
+    const auto processedRms = render();
+    expect(untouchedRms - processedRms > 6.0f,
+           "per-stem processing must pull the rumble-dominated mix down on its own side");
+}
+
 CSP_TEST_CASE void testRoomCalibrationMeasuresDecayAndResonance()
 {
     constexpr double sampleRate = 48000.0;
@@ -1839,6 +2416,662 @@ CSP_TEST_CASE void testObsWebSocketAuthenticationVector()
 }
 }
 
+
+// Renders `seconds` of a two-channel signal produced by `generate(sampleIndex)`
+// and returns the RMS of the last `tailSeconds`.
+float renderSignalRms(churchstream::ProcessingEngine& engine, int blockSize, double sampleRate,
+                      double seconds, double tailSeconds,
+                      const std::function<float(int64_t)>& generate)
+{
+    std::vector<float> left(static_cast<size_t>(blockSize)), right(static_cast<size_t>(blockSize));
+    float* channels[] { left.data(), right.data() };
+    const auto totalBlocks = static_cast<int>(seconds * sampleRate / blockSize);
+    const auto tailBlocks = static_cast<int>(tailSeconds * sampleRate / blockSize);
+    int64_t index = 0;
+    double squares = 0.0;
+    int64_t counted = 0;
+    for (int block = 0; block < totalBlocks; ++block)
+    {
+        for (int sample = 0; sample < blockSize; ++sample)
+        {
+            const auto value = generate(index++);
+            left[static_cast<size_t>(sample)] = value;
+            right[static_cast<size_t>(sample)] = value;
+        }
+        engine.process(channels, 2, blockSize);
+        if (block >= totalBlocks - tailBlocks)
+            for (const auto value : left)
+            {
+                squares += static_cast<double>(value) * value;
+                ++counted;
+            }
+    }
+    return counted > 0 ? static_cast<float>(std::sqrt(squares / static_cast<double>(counted))) : 0.0f;
+}
+
+CSP_TEST_CASE void testDeEsserActsOnSibilantsNotOnSteadyTone()
+{
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 256;
+    const auto pi = juce::MathConstants<double>::pi;
+
+    // A voice band plus a 7 kHz burst every 400 ms, which is roughly how often
+    // and how briefly a real sibilant arrives.
+    const auto sibilant = [pi](int64_t index) {
+        const auto seconds = static_cast<double>(index) / 48000.0;
+        const auto voice = 0.25 * std::sin(2.0 * pi * 400.0 * seconds);
+        const auto phase = std::fmod(seconds, 0.40);
+        const auto burst = phase < 0.10 ? 0.25 * std::sin(2.0 * pi * 7000.0 * seconds) : 0.0;
+        return static_cast<float>(voice + burst);
+    };
+
+    const auto configure = [](churchstream::ProcessingEngine& engine, bool deEsser) {
+        auto& p = engine.getParameters();
+        p.smartProcessing.store(false);
+        p.rumbleEnabled.store(false);
+        p.compressorEnabled.store(false);
+        p.saturationEnabled.store(false);
+        p.limiterEnabled.store(false);
+        p.broadcastLevelerEnabled.store(false);
+        p.dynamicEqEnabled.store(false);
+        p.deEsserEnabled.store(deEsser);
+        p.clarity.store(0.0f);
+        p.warmth.store(0.0f);
+        p.clean.store(0.0f);
+    };
+
+    auto withDeEsser = std::make_unique<churchstream::ProcessingEngine>();
+    withDeEsser->prepare(sampleRate, blockSize, 2);
+    configure(*withDeEsser, true);
+    // The peak across the render, not the value at the end of it: a de-esser
+    // that works is back at zero between sibilants, so sampling the metric once
+    // measures nothing but where the last block happened to land.
+    auto deEsserReduction = 0.0f;
+    {
+        std::vector<float> left(blockSize), right(blockSize);
+        float* channels[] { left.data(), right.data() };
+        int64_t index = 0;
+        for (int block = 0; block < static_cast<int>(6.0 * sampleRate / blockSize); ++block)
+        {
+            for (int sample = 0; sample < blockSize; ++sample)
+                left[static_cast<size_t>(sample)] = right[static_cast<size_t>(sample)] = sibilant(index++);
+            withDeEsser->process(channels, 2, blockSize);
+            deEsserReduction = std::max(deEsserReduction,
+                                        withDeEsser->getMetrics().deEsserReductionDb.load());
+        }
+    }
+    withDeEsser->reset();
+    const auto treated = renderSignalRms(*withDeEsser, blockSize, sampleRate, 6.0, 2.0, sibilant);
+
+    auto without = std::make_unique<churchstream::ProcessingEngine>();
+    without->prepare(sampleRate, blockSize, 2);
+    configure(*without, false);
+    const auto untreated = renderSignalRms(*without, blockSize, sampleRate, 6.0, 2.0, sibilant);
+
+    expect(deEsserReduction > 1.0f, "the de-esser must engage on a repeating sibilant burst");
+    expect(treated < untreated * 0.99f, "the de-esser must measurably reduce the sibilant energy");
+
+    // The same 7 kHz energy, but continuous. A continuous tone becomes its own
+    // reference, so a de-esser must leave it alone: a detector that fires on it
+    // is a high shelf with extra steps, and it is what makes a whole service
+    // sound dull instead of only the esses.
+    const auto steady = [pi](int64_t index) {
+        const auto seconds = static_cast<double>(index) / 48000.0;
+        return static_cast<float>(0.25 * std::sin(2.0 * pi * 400.0 * seconds)
+                                  + 0.25 * std::sin(2.0 * pi * 7000.0 * seconds));
+    };
+    auto steadyEngine = std::make_unique<churchstream::ProcessingEngine>();
+    steadyEngine->prepare(sampleRate, blockSize, 2);
+    configure(*steadyEngine, true);
+    auto steadyPeak = 0.0f;
+    {
+        std::vector<float> left(blockSize), right(blockSize);
+        float* channels[] { left.data(), right.data() };
+        int64_t index = 0;
+        const auto totalBlocks = static_cast<int>(8.0 * sampleRate / blockSize);
+        for (int block = 0; block < totalBlocks; ++block)
+        {
+            for (int sample = 0; sample < blockSize; ++sample)
+                left[static_cast<size_t>(sample)] = right[static_cast<size_t>(sample)] = steady(index++);
+            steadyEngine->process(channels, 2, blockSize);
+            // Skipped while the band's own average is still filling: until it
+            // has, the tone genuinely is an excess over what came before.
+            if (block > totalBlocks / 2)
+                steadyPeak = std::max(steadyPeak, steadyEngine->getMetrics().deEsserReductionDb.load());
+        }
+    }
+    expect(steadyPeak < 0.5f, "a continuous 7 kHz tone must not hold the de-esser down");
+}
+
+CSP_TEST_CASE void testCompressorMakeupKeepsLevel()
+{
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 256;
+    const auto pi = juce::MathConstants<double>::pi;
+    const auto tone = [pi](int64_t index) {
+        return static_cast<float>(0.5 * std::sin(2.0 * pi * 300.0 * static_cast<double>(index) / 48000.0));
+    };
+
+    const auto configure = [](churchstream::ProcessingEngine& engine, bool compressor) {
+        auto& p = engine.getParameters();
+        p.smartProcessing.store(false);
+        p.rumbleEnabled.store(false);
+        p.adaptiveEqEnabled.store(false);
+        p.dynamicEqEnabled.store(false);
+        p.deEsserEnabled.store(false);
+        p.saturationEnabled.store(false);
+        p.limiterEnabled.store(false);
+        p.broadcastLevelerEnabled.store(false);
+        p.compressorEnabled.store(compressor);
+        p.dynamics.store(1.0f);
+    };
+
+    auto compressed = std::make_unique<churchstream::ProcessingEngine>();
+    compressed->prepare(sampleRate, blockSize, 2);
+    configure(*compressed, true);
+    const auto compressedRms = renderSignalRms(*compressed, blockSize, sampleRate, 8.0, 1.0, tone);
+
+    auto clean = std::make_unique<churchstream::ProcessingEngine>();
+    clean->prepare(sampleRate, blockSize, 2);
+    configure(*clean, false);
+    const auto cleanRms = renderSignalRms(*clean, blockSize, sampleRate, 8.0, 1.0, tone);
+
+    expect(compressed->getMetrics().compressorGainReductionDb.load() > 4.0f,
+           "the fixture must actually be compressing, otherwise it proves nothing about makeup");
+    // Without makeup this ratio was the full gain reduction: every dB of
+    // compression was a dB less output, so loud passages got quieter instead of
+    // denser. Makeup returns most of the sustained reduction and leaves the
+    // rest, so the level lands close to unity without being pinned to it.
+    const auto differenceDb = 20.0f * std::log10(std::max(compressedRms, 1.0e-9f)
+                                                 / std::max(cleanRms, 1.0e-9f));
+    expect(differenceDb > -3.0f,
+           "compressor makeup must stop sustained compression from simply turning the programme down");
+    expect(differenceDb < 1.5f, "compressor makeup must not overshoot into a level boost");
+}
+
+CSP_TEST_CASE void testLevelerFollowsTheOperatorLoudnessTarget()
+{
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 256;
+    const auto pi = juce::MathConstants<double>::pi;
+    const auto tone = [pi](int64_t index) {
+        return static_cast<float>(0.05 * std::sin(2.0 * pi * 700.0 * static_cast<double>(index) / 48000.0));
+    };
+
+    const auto gainForTarget = [&](float targetDb) {
+        auto engine = std::make_unique<churchstream::ProcessingEngine>();
+        engine->prepare(sampleRate, blockSize, 2);
+        auto& p = engine->getParameters();
+        p.smartProcessing.store(false);
+        p.rumbleEnabled.store(false);
+        p.adaptiveEqEnabled.store(false);
+        p.dynamicEqEnabled.store(false);
+        p.deEsserEnabled.store(false);
+        p.compressorEnabled.store(false);
+        p.saturationEnabled.store(false);
+        p.limiterEnabled.store(false);
+        p.broadcastLevelerEnabled.store(true);
+        p.loudnessTarget.store(targetDb);
+        renderSignalRms(*engine, blockSize, sampleRate, 20.0, 1.0, tone);
+        return engine->getMetrics().broadcastLevelGainDb.load();
+    };
+
+    // The leveller used to aim at a hard-coded -19 dBFS RMS while the operator
+    // set a LUFS target that only the Smart Engine's output gain saw, and
+    // because the leveller measures after that gain it cancelled it. Six dB of
+    // target has to produce six dB of gain, or the two are not the same loop.
+    const auto quiet = gainForTarget(-20.0f);
+    const auto loud = gainForTarget(-14.0f);
+    expect(loud - quiet > 5.0f && loud - quiet < 7.0f,
+           "the leveller must move one dB for every dB of the operator's loudness target");
+}
+
+CSP_TEST_CASE void testSmartLoudnessGainDoesNotFightTheLeveler()
+{
+    auto engine = std::make_unique<churchstream::ProcessingEngine>();
+    engine->prepare(48000.0, 256, 2);
+    auto& p = engine->getParameters();
+    p.smartProcessing.store(true);
+    p.broadcastLevelerEnabled.store(true);
+    engine->getAdaptiveTargets().loudnessGainDb.store(4.0f);
+
+    std::vector<float> left(256, 0.1f), right(256, 0.1f);
+    float* channels[] { left.data(), right.data() };
+    for (int block = 0; block < 400; ++block)
+    {
+        std::fill(left.begin(), left.end(), 0.1f);
+        std::fill(right.begin(), right.end(), 0.1f);
+        engine->process(channels, 2, 256);
+    }
+    expect(std::abs(engine->getMetrics().appliedOutputGainDb.load()) < 0.1f,
+           "the Smart output gain must stand down while the leveller owns the programme level");
+
+    p.broadcastLevelerEnabled.store(false);
+    for (int block = 0; block < 400; ++block)
+    {
+        std::fill(left.begin(), left.end(), 0.1f);
+        std::fill(right.begin(), right.end(), 0.1f);
+        engine->process(channels, 2, 256);
+    }
+    expect(engine->getMetrics().appliedOutputGainDb.load() > 2.0f,
+           "the Smart output gain must take the programme level back when the leveller is off");
+}
+
+CSP_TEST_CASE void testRumbleFilterIsFourthOrder()
+{
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 256;
+    const auto pi = juce::MathConstants<double>::pi;
+
+    const auto responseAt = [&](float frequency) {
+        auto engine = std::make_unique<churchstream::ProcessingEngine>();
+        engine->prepare(sampleRate, blockSize, 2);
+        auto& p = engine->getParameters();
+        p.smartProcessing.store(false);
+        p.adaptiveEqEnabled.store(false);
+        p.dynamicEqEnabled.store(false);
+        p.deEsserEnabled.store(false);
+        p.compressorEnabled.store(false);
+        p.saturationEnabled.store(false);
+        p.limiterEnabled.store(false);
+        p.broadcastLevelerEnabled.store(false);
+        p.rumbleEnabled.store(true);
+        // clean = 0 puts the corner at 30 Hz, the bottom of its range.
+        p.clean.store(0.0f);
+        const auto rms = renderSignalRms(*engine, blockSize, sampleRate, 6.0, 1.0,
+            [&](int64_t index) {
+                return static_cast<float>(0.25 * std::sin(2.0 * pi * frequency
+                                                          * static_cast<double>(index) / sampleRate));
+            });
+        return 20.0f * std::log10(std::max(rms, 1.0e-9f) / (0.25f / std::sqrt(2.0f)));
+    };
+
+    const auto atCorner = responseAt(30.0f);
+    const auto anOctaveDown = responseAt(15.0f);
+    expect(std::abs(atCorner + 3.0f) < 2.0f, "the rumble filter must be about -3 dB at its corner");
+    // Second order gives 12 dB per octave, fourth order 24. Measured across one
+    // octave below the corner the difference is unmistakable, and it is the
+    // difference between removing stage thump and only pretending to.
+    expect(anOctaveDown - atCorner < -18.0f,
+           "the rumble filter must roll off at fourth order, not second");
+}
+
+CSP_TEST_CASE void testTransientDensityKeepsRespondingAfterALongService()
+{
+    // The counters behind this used to run for the lifetime of the stream, so
+    // after a few minutes a new chunk moved the average by hundredths of a
+    // percent and the reading froze. `classifyContext` reads it in five of its
+    // seven branches, so the whole context classifier quietly stopped
+    // responding partway through every service.
+    constexpr double sampleRate = 48000.0;
+    auto analysis = std::make_unique<churchstream::AnalysisEngine>();
+    analysis->prepareOffline(sampleRate);
+
+    constexpr int chunk = 4096;
+    std::vector<float> silenceLeft(chunk, 0.0f), silenceRight(chunk, 0.0f);
+    std::vector<float> burstLeft(chunk), burstRight(chunk);
+
+    // Six minutes of quiet, transient-free programme.
+    const auto pi = juce::MathConstants<double>::pi;
+    int64_t index = 0;
+    const auto pushSteady = [&](int chunks) {
+        for (int c = 0; c < chunks; ++c)
+        {
+            for (int sample = 0; sample < chunk; ++sample)
+            {
+                const auto value = static_cast<float>(
+                    0.20 * std::sin(2.0 * pi * 220.0 * static_cast<double>(index++) / sampleRate));
+                burstLeft[static_cast<size_t>(sample)] = value;
+                burstRight[static_cast<size_t>(sample)] = value;
+            }
+            analysis->pushOffline(silenceLeft.data(), silenceRight.data(),
+                                  burstLeft.data(), burstRight.data(), chunk);
+        }
+    };
+    pushSteady(static_cast<int>(360.0 * sampleRate / chunk));
+    const auto quietDensity = analysis->finishOfflineUpdate(8.0).processed.transientDensity;
+
+    // Now a dense, percussive passage. A frozen average cannot follow this.
+    const auto pushTransients = [&](int chunks) {
+        for (int c = 0; c < chunks; ++c)
+        {
+            for (int sample = 0; sample < chunk; ++sample)
+            {
+                const auto seconds = static_cast<double>(index++) / sampleRate;
+                const auto phase = std::fmod(seconds, 0.15);
+                const auto value = static_cast<float>(
+                    phase < 0.010 ? 0.8 * std::sin(2.0 * pi * 900.0 * seconds) : 0.0);
+                burstLeft[static_cast<size_t>(sample)] = value;
+                burstRight[static_cast<size_t>(sample)] = value;
+            }
+            analysis->pushOffline(silenceLeft.data(), silenceRight.data(),
+                                  burstLeft.data(), burstRight.data(), chunk);
+        }
+    };
+    pushTransients(static_cast<int>(30.0 * sampleRate / chunk));
+    const auto busyDensity = analysis->finishOfflineUpdate(8.0).processed.transientDensity;
+
+    expect(quietDensity < 1.0f, "steady programme must read as low transient density");
+    expect(busyDensity > 3.0f,
+           "transient density must still respond after six minutes of stream, not sit on a lifetime average");
+}
+
+CSP_TEST_CASE void testSpectrumIsAveragedNotASingleWindow()
+{
+    // One 43 ms periodogram has a variance equal to its own mean, and taking a
+    // single one per update also threw away most of the audio. Every tonal
+    // decision is made on these bands, so that noise went straight into the
+    // corrections. Averaging across the chunk is what makes them repeatable.
+    constexpr double sampleRate = 48000.0;
+    constexpr int chunk = 8192;
+    auto analysis = std::make_unique<churchstream::AnalysisEngine>();
+    analysis->prepareOffline(sampleRate);
+
+    std::vector<float> left(chunk), right(chunk);
+    std::vector<float> quiet(chunk, 0.0f);
+    juce::Random random(20260907);
+
+    std::vector<float> presenceLevel;
+    std::vector<float> presenceShare;
+    for (int update = 0; update < 12; ++update)
+    {
+        // Four chunks per update. The point is that the number of transforms
+        // has to grow with the audio: before averaging, feeding more samples
+        // changed nothing at all, because a single 43 ms window was taken
+        // however much audio had arrived.
+        for (int part = 0; part < 4; ++part)
+        {
+            for (int sample = 0; sample < chunk; ++sample)
+            {
+                const auto noise = static_cast<float>(random.nextDouble() * 2.0 - 1.0) * 0.2f;
+                left[static_cast<size_t>(sample)] = noise;
+                right[static_cast<size_t>(sample)] = noise;
+            }
+            analysis->pushOffline(quiet.data(), quiet.data(), left.data(), right.data(), chunk);
+        }
+        const auto snapshot = analysis->finishOfflineUpdate(8.0);
+        if (update >= 2)
+        {
+            presenceShare.push_back(snapshot.processed.bandEnergy[2]);
+            presenceLevel.push_back(snapshot.processed.bandLevelDb[2]);
+        }
+    }
+
+    const auto spreadOf = [](const std::vector<float>& values) {
+        auto mean = 0.0f;
+        for (const auto value : values) mean += value;
+        mean /= static_cast<float>(values.size());
+        auto spread = 0.0f;
+        for (const auto value : values) spread = std::max(spread, std::abs(value - mean));
+        return std::make_pair(mean, spread);
+    };
+
+    const auto [shareMean, shareSpread] = spreadOf(presenceShare);
+    const auto [levelMean, levelSpread] = spreadOf(presenceLevel);
+    expect(shareMean > 0.05f, "white noise must put real energy in the presence band");
+    expect(levelMean > -90.0f, "absolute band levels must be reported alongside the shares");
+    // The absolute level is the clean measurement: it is not divided by a total
+    // that carries the noise of every other band. A single unaveraged 2048-point
+    // periodogram of this band wanders by several dB between updates.
+    expect(levelSpread < 0.6f,
+           "the averaged spectrum must hold a stationary band level steady between updates");
+    expect(shareSpread < shareMean * 0.12f,
+           "the averaged band shares must be repeatable on stationary noise");
+}
+
+CSP_TEST_CASE void testKWeightedLevelerIgnoresSubBassWeighting()
+{
+    // A flat RMS detector is dominated by the kick and the bass, so the same
+    // voice ends up levelled differently depending on what the band plays under
+    // it. K-weighting is what makes speech and worship land in the same place.
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 256;
+    const auto pi = juce::MathConstants<double>::pi;
+
+    const auto gainFor = [&](float frequency) {
+        auto engine = std::make_unique<churchstream::ProcessingEngine>();
+        engine->prepare(sampleRate, blockSize, 2);
+        auto& p = engine->getParameters();
+        p.smartProcessing.store(false);
+        p.rumbleEnabled.store(false);
+        p.adaptiveEqEnabled.store(false);
+        p.dynamicEqEnabled.store(false);
+        p.deEsserEnabled.store(false);
+        p.compressorEnabled.store(false);
+        p.saturationEnabled.store(false);
+        p.limiterEnabled.store(false);
+        p.broadcastLevelerEnabled.store(true);
+        p.loudnessTarget.store(-16.0f);
+        renderSignalRms(*engine, blockSize, sampleRate, 20.0, 1.0, [&](int64_t index) {
+            return static_cast<float>(0.08 * std::sin(2.0 * pi * frequency
+                                                      * static_cast<double>(index) / sampleRate));
+        });
+        return engine->getMetrics().broadcastLevelGainDb.load();
+    };
+
+    // Both tones carry identical electrical power. A 50 Hz tone is heard far
+    // more quietly than a 1 kHz one, so a loudness detector must ask for more
+    // gain on the 50 Hz one. A flat RMS asks for exactly the same.
+    const auto lowGain = gainFor(50.0f);
+    const auto midGain = gainFor(1000.0f);
+    expect(lowGain - midGain > 4.0f,
+           "the leveller detector must weight low frequencies the way a listener does");
+}
+
+bool writeWav(const juce::File& target, const juce::AudioBuffer<float>& buffer, double sampleRate)
+{
+    juce::WavAudioFormat format;
+    juce::StringPairArray metadata;
+    std::unique_ptr<juce::OutputStream> stream(target.createOutputStream());
+    if (stream == nullptr)
+        return false;
+    std::unique_ptr<juce::AudioFormatWriter> writer(
+        format.createWriterFor(stream.get(), sampleRate, buffer.getNumChannels(), 16, metadata, 0));
+    if (writer == nullptr)
+        return false;
+    stream.release();
+    return writer->writeFromAudioSampleBuffer(buffer, 0, buffer.getNumSamples());
+}
+
+churchstream::SignalMetrics measureProcessed(const juce::AudioBuffer<float>& buffer, double sampleRate)
+{
+    churchstream::AnalysisEngine analysis;
+    analysis.prepareOffline(sampleRate);
+    constexpr int chunk = 4096;
+    const auto total = buffer.getNumSamples();
+    for (int position = 0; position < total; position += chunk)
+    {
+        const auto count = std::min(chunk, total - position);
+        analysis.pushOffline(buffer.getReadPointer(0) + position, buffer.getReadPointer(1) + position,
+                             buffer.getReadPointer(0) + position, buffer.getReadPointer(1) + position,
+                             count);
+    }
+    return analysis.finishOfflineUpdate(8.0).processed;
+}
+
+CSP_TEST_CASE void testReferenceProfileCaptureAndJsonRoundTrip()
+{
+    const auto directory = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                               .getChildFile("CSP Reference Match Tests");
+    directory.createDirectory();
+
+    constexpr double sampleRate = 48000.0;
+    constexpr int samples = static_cast<int>(sampleRate * 3.0);
+    juce::AudioBuffer<float> bright(2, samples);
+    juce::Random random;
+    for (int i = 0; i < samples; ++i)
+    {
+        const auto t = static_cast<float>(i) / static_cast<float>(sampleRate);
+        const auto noise = 0.5f * random.nextFloat() - 0.25f;
+        const auto low = 0.2f * std::sin(juce::MathConstants<float>::twoPi * 150.0f * t);
+        const auto presence = 0.05f * std::sin(juce::MathConstants<float>::twoPi * 3000.0f * t);
+        bright.setSample(0, i, noise + low + presence);
+        bright.setSample(1, i, noise + low + presence);
+    }
+
+    const auto waveFile = directory.getChildFile("reference.wav");
+    expect(writeWav(waveFile, bright, sampleRate), "reference wav must be written");
+
+    juce::String error;
+    const auto profile = churchstream::ReferenceProfile::capture(waveFile, error);
+    expect(profile.valid, "a real recording must produce a valid reference profile");
+    expect(error.isEmpty(), "a successful capture must not report an error");
+
+    const auto highest = std::max_element(profile.bandLevelDb.begin(), profile.bandLevelDb.end());
+    const auto lowest = std::min_element(profile.bandLevelDb.begin(), profile.bandLevelDb.end());
+    expect(*highest - *lowest > 15.0f,
+           "the 150 Hz hammer and silent upper bands must give the profile a real spread");
+    expect(profile.lufsIntegrated > -35.0f && profile.lufsIntegrated < -5.0f,
+           "the capture must measure a real long-term loudness");
+    expect(profile.durationSeconds > 2.0f, "the profile must know how long the reference lasts");
+
+    const auto stored = directory.getChildFile("reference.cspref");
+    expect(profile.save(stored), "reference profile must save to JSON");
+    const auto loaded = churchstream::ReferenceProfile::load(stored);
+    expect(loaded.valid, "saved reference must load back as valid");
+    bool bandsMatch = true;
+    for (int band = 0; band < churchstream::psychoacoustics::criticalBandCount; ++band)
+        if (std::abs(profile.bandLevelDb[static_cast<size_t>(band)] - loaded.bandLevelDb[static_cast<size_t>(band)]) > 0.5f)
+            bandsMatch = false;
+    expect(bandsMatch, "the loaded band balance must survive the JSON round trip");
+    expect(approximately(loaded.lufsIntegrated, profile.lufsIntegrated, 1.0f),
+           "the loaded loudness must survive the JSON round trip");
+    expect(loaded.sourceName == profile.sourceName,
+           "the loaded source name must survive the JSON round trip");
+
+    juce::AudioBuffer<float> silence(2, samples);
+    silence.clear();
+    const auto silentFile = directory.getChildFile("silence.wav");
+    (void)writeWav(silentFile, silence, sampleRate);
+    const auto silentProfile = churchstream::ReferenceProfile::capture(silentFile, error);
+    expect(!silentProfile.valid, "silence must not become a reference profile");
+    expect(error.isNotEmpty(), "a failed capture must explain why");
+
+    waveFile.deleteFile();
+    silentFile.deleteFile();
+    stored.deleteFile();
+    directory.deleteRecursively();
+}
+
+CSP_TEST_CASE void testReferenceComparisonIsLoudnessNormalised()
+{
+    constexpr double sampleRate = 48000.0;
+    constexpr int samples = static_cast<int>(sampleRate * 4.0);
+
+    // Three steady tones, one in graves (250 Hz), one in cuerpo (840 Hz) and
+    // one in presencia (2900 Hz), with nothing in brillo. Deterministic, and
+    // each tone maps cleanly into exactly one critical band.
+    const auto tone = [&](int sample, float hertz, float amplitude) {
+        return amplitude * std::sin(juce::MathConstants<float>::twoPi
+                                    * hertz * static_cast<float>(sample) / static_cast<float>(sampleRate));
+    };
+    juce::AudioBuffer<float> bright(2, samples);
+    for (int i = 0; i < samples; ++i)
+    {
+        const auto value = tone(i, 250.0f, 0.20f) + tone(i, 840.0f, 0.20f) + tone(i, 2900.0f, 0.16f);
+        bright.setSample(0, i, value);
+        bright.setSample(1, i, value);
+    }
+
+    const auto directory = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                               .getChildFile("CSP Reference Match Tests");
+    directory.createDirectory();
+    const auto brightFile = directory.getChildFile("bright.wav");
+    const auto dullFile = directory.getChildFile("dull.wav");
+    expect(writeWav(brightFile, bright, sampleRate), "bright wav must be written");
+
+    juce::String error;
+    const auto profile = churchstream::ReferenceProfile::capture(brightFile, error);
+    expect(profile.valid, "identical programme must produce a reference");
+
+    // The same samples, re-measured through the offline path, must compare as
+    // no difference at all.
+    const auto same = churchstream::ReferenceMatchEngine::compare(
+        profile, measureProcessed(bright, sampleRate), sampleRate, 4.0f);
+    expect(same.active && same.meaningful, "same programme must be an active, meaningful match");
+    expect(std::abs(same.loudnessDifferenceDb) < 2.0f,
+           "same loudness must not be reported as a volume difference");
+    for (int zone = 0; zone < churchstream::referenceZoneCount; ++zone)
+        expect(std::abs(same.zoneDifferenceDb[static_cast<size_t>(zone)]) < 2.0f,
+               "identical programme must not show a tonal difference in any zone");
+
+    // The same programme with the 2.9 kHz presence tone dropped by ~18 dB. The
+    // graves and cuerpo tones stay untouched: the verdict must land on the
+    // presence zone and leave the others alone.
+    juce::AudioBuffer<float> dull(2, samples);
+    for (int i = 0; i < samples; ++i)
+    {
+        const auto value = tone(i, 250.0f, 0.20f) + tone(i, 840.0f, 0.20f) + tone(i, 2900.0f, 0.02f);
+        dull.setSample(0, i, value);
+        dull.setSample(1, i, value);
+    }
+(void)writeWav(dullFile, dull, sampleRate);
+    const auto duller = churchstream::ReferenceMatchEngine::compare(
+        profile, measureProcessed(dull, sampleRate), sampleRate, 4.0f);
+    expect(duller.active && duller.meaningful, "duller programme must still be comparable");
+    expect(duller.zoneDifferenceDb[2] < -2.0f,
+           "a programme missing its presence tone must show up as less presencia");
+    // The graves and cuerpo tones are untouched, so once the loudness anchor
+    // shifts they sit slightly hotter than the reference. The presence zone,
+    // which carried signal and got cut, must sit clearly below both of them.
+    expect(duller.zoneDifferenceDb[2] + 2.0f < duller.zoneDifferenceDb[0]
+               && duller.zoneDifferenceDb[2] + 2.0f < duller.zoneDifferenceDb[1],
+           "presencia must lose the most of any zone that carried signal");
+
+    bool mentionsPresence = false;
+    for (const auto& line : duller.lines)
+        if (line.contains("presencia") && line.contains("menos"))
+            mentionsPresence = true;
+    expect(mentionsPresence, "the verdict must say the presence zone is missing level");
+
+    brightFile.deleteFile();
+    dullFile.deleteFile();
+    directory.deleteRecursively();
+}
+
+CSP_TEST_CASE void testReferenceMatchEnginePublishesComparison()
+{
+    churchstream::AnalysisEngine analysis;
+    churchstream::ReferenceMatchEngine engine(analysis);
+
+    churchstream::ReferenceProfile profile;
+    profile.bandLevelDb.fill(-50.0f);
+    profile.lufsIntegrated = -20.0f;
+    profile.valid = true;
+    profile.sourceName = "Primer servicio";
+    engine.setProfile(profile);
+
+    churchstream::AnalysisSnapshot snapshot;
+    snapshot.sampleRate = 48000.0;
+    snapshot.analyzedFrames = 48000 * 4;
+    auto& live = snapshot.processed;
+    live.rmsDb = -20.0f;
+    live.lufsShortTerm = -20.0f;
+    live.crestFactorDb = 12.0f;
+    live.stereoWidth = 0.5f;
+    live.spectrumDb.fill(-60.0f);
+    for (int bin = 0; bin < churchstream::spectrumBins; ++bin)
+        live.spectrumDb[static_cast<size_t>(bin)] = -60.0f;
+
+    engine.processSnapshotForTesting(snapshot);
+    auto comparison = engine.getComparison();
+    expect(comparison.active, "a loaded profile must publish an active comparison");
+    expect(comparison.meaningful, "real live audio must produce a meaningful comparison");
+    expect(std::abs(comparison.loudnessDifferenceDb) < 0.5f,
+           "equal loudness must report no volume difference");
+
+    snapshot.analyzedFrames = 48000 * 6;
+    engine.processSnapshotForTesting(snapshot);
+    comparison = engine.getComparison();
+    expect(comparison.liveSeconds >= 1.0f,
+           "live seconds must accumulate across snapshots");
+
+    engine.clearProfile();
+    engine.processSnapshotForTesting(snapshot);
+    expect(!engine.getComparison().active,
+           "without a profile the comparison must go inactive");
+}
+
 int main()
 {
     testStereoPassthrough();
@@ -1851,6 +3084,7 @@ int main()
     testSmartEnginePersistenceConfidenceAndLimits();
     testAutoTuneBuildsRealBaseline();
     testSmartQualityClosedLoopAndRollback();
+    testResetAdaptiveCorrections();
     testSafetyControllerAndSmartMasking();
     testAutomaticMultigroupRouting();
     testEqDynamicEqAndCompressorBehaviour();
@@ -1871,8 +3105,23 @@ int main()
     testX32ClientIsReadOnly();
     testX32ClientTalksToAConsole();
     testGroupMixerFallbackAndMasking();
+    testStemProcessorIdentityWhenDisabled();
+    testStemVoiceChainRemovesRumbleAndTamesSibilance();
+    testStemMusicAndAmbienceChains();
+    testStemProcessingInsideGroupMixer();
     testRoomCalibrationMeasuresDecayAndResonance();
     testObsWebSocketAuthenticationVector();
+    testDeEsserActsOnSibilantsNotOnSteadyTone();
+    testCompressorMakeupKeepsLevel();
+    testLevelerFollowsTheOperatorLoudnessTarget();
+    testSmartLoudnessGainDoesNotFightTheLeveler();
+    testRumbleFilterIsFourthOrder();
+    testTransientDensityKeepsRespondingAfterALongService();
+    testSpectrumIsAveragedNotASingleWindow();
+    testKWeightedLevelerIgnoresSubBassWeighting();
+    testReferenceProfileCaptureAndJsonRoundTrip();
+    testReferenceComparisonIsLoudnessNormalised();
+    testReferenceMatchEnginePublishesComparison();
 
     if (failures == 0)
         std::cout << "All audio, DSP, analyzer, and Smart Engine tests passed.\n";

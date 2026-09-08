@@ -56,6 +56,19 @@ void StatusBadge::paint(juce::Graphics& graphics)
 }
 
 MainComponent::MainComponent(bool startAudio)
+    : analystClient([this]
+      {
+          auto token = settings.getString("churchSoundAnalystToken");
+          if (token.isEmpty())
+          {
+              token = juce::Uuid().toString().removeCharacters("{}-");
+              settings.setString("churchSoundAnalystToken", token);
+              settings.flush();
+          }
+          AppSettings::getDataDirectory().getChildFile("church-sound-analyst.token")
+              .replaceWithText(token);
+          return token;
+      }())
 {
     setLookAndFeel(&theme);
     setOpaque(true);
@@ -124,10 +137,13 @@ MainComponent::MainComponent(bool startAudio)
     bypassButton.setColour(juce::TextButton::buttonColourId, Colours::danger.withAlpha(0.85f));
     abButton.setClickingTogglesState(true);
     bypassButton.setClickingTogglesState(true);
+    resetDspButton.setTooltip("Returns all DSP tone controls to their defaults and clears current Smart corrections.");
+    addAndMakeVisible(resetDspButton);
 
     configureHeading(measurementsTitle, 12.0f, Colours::text);
     measurementsTitle.setText("MEASUREMENTS", juce::dontSendNotification);
     addAndMakeVisible(measurementsTitle);
+    addAndMakeVisible(qualityPanel);
     const std::array<juce::String, 8> metricTitles { "LUFS INTEGRATED", "LUFS SHORT TERM", "LUFS MOMENTARY", "TRUE PEAK",
                                                      "RMS", "PEAK", "GAIN REDUCTION", "STEREO CORR" };
     for (size_t index = 0; index < metricNames.size(); ++index)
@@ -150,6 +166,7 @@ MainComponent::MainComponent(bool startAudio)
     configureHeading(routingTitle, 11.0f, Colours::text);
     routingTitle.setText("AUDIO ROUTING", juce::dontSendNotification);
     addAndMakeVisible(routingTitle);
+    addAndMakeVisible(x32Panel);
     configureHeading(inputLabel, 9.5f, Colours::mutedText);
     inputLabel.setText("INPUT", juce::dontSendNotification);
     addAndMakeVisible(inputLabel);
@@ -169,6 +186,8 @@ MainComponent::MainComponent(bool startAudio)
     addAndMakeVisible(obsPasswordEditor);
     addAndMakeVisible(connectObsButton);
     addAndMakeVisible(offlineTestButton);
+    addAndMakeVisible(analystButton);
+    analystButton.setTooltip("Envía una grabación al servicio local opcional; nunca afecta el DSP en vivo.");
     churchNameEditor.setText(settings.getString("churchName", "Mi Iglesia"), false);
     churchNameEditor.setTextToShowWhenEmpty("CHURCH PROFILE NAME", Colours::mutedText);
     churchNameEditor.setTooltip("Persistent local learning profile; no audio is stored.");
@@ -234,6 +253,25 @@ MainComponent::MainComponent(bool startAudio)
                                                  AppSettings::getDataDirectory().getChildFile("church-profile.json"));
         });
     };
+    analystButton.onClick = [this]
+    {
+        analystFileChooser = std::make_unique<juce::FileChooser>("Select recording for Church Sound Analyst",
+                                                                  juce::File(), "*.wav;*.flac;*.aif;*.aiff");
+        analystFileChooser->launchAsync(juce::FileBrowserComponent::openMode
+                                            | juce::FileBrowserComponent::canSelectFiles,
+                                        [this](const juce::FileChooser& chooser)
+        {
+            const auto file = chooser.getResult();
+            if (!file.existsAsFile()) return;
+            messageLabel.setText("Church Sound Analyst: analysing offline...", juce::dontSendNotification);
+            analystClient.analyzeFile(file, [this](bool ok, juce::String response)
+            {
+                messageLabel.setText(ok ? "Church Sound Analyst: report received (preview in JSON)"
+                                         : "Church Sound Analyst: " + response,
+                                     juce::dontSendNotification);
+            });
+        });
+    };
     startWithWindows.onClick = [this]
     {
         const auto enabled = startWithWindows.getToggleState();
@@ -270,7 +308,14 @@ MainComponent::MainComponent(bool startAudio)
         juce::PopupMenu menu;
         menu.addSectionHeader("DSP MODULES");
         menu.addItem(1, "Rumble control", true, parameters.rumbleEnabled.load());
-        menu.addItem(2, "Adaptive / dynamic EQ", true, parameters.adaptiveEqEnabled.load());
+        menu.addItem(2, "Adaptive EQ", true, parameters.adaptiveEqEnabled.load());
+        // Both ride on the adaptive EQ, because they are extracted from its
+        // output. Shown as disabled rather than hidden when it is off, so the
+        // dependency is visible instead of looking like a bug.
+        menu.addItem(7, "Dynamic EQ (mud / harshness)", parameters.adaptiveEqEnabled.load(),
+                     parameters.dynamicEqEnabled.load());
+        menu.addItem(8, "De-esser", parameters.adaptiveEqEnabled.load(),
+                     parameters.deEsserEnabled.load());
         menu.addItem(3, "4-band dynamics", true, parameters.compressorEnabled.load());
         menu.addItem(4, "Harmonic enhancer", true, parameters.saturationEnabled.load());
         menu.addItem(5, protectLimiter ? "True-peak limiter (LIVE SAFE)" : "True-peak limiter",
@@ -315,6 +360,8 @@ MainComponent::MainComponent(bool startAudio)
             else if (selected == 4) toggle(p.saturationEnabled, "saturationEnabled");
             else if (selected == 5 && !liveRoutingLocked()) toggle(p.limiterEnabled, "limiterEnabled");
             else if (selected == 6) toggle(p.broadcastLevelerEnabled, "broadcastLevelerEnabled");
+            else if (selected == 7) toggle(p.dynamicEqEnabled, "dynamicEqEnabled");
+            else if (selected == 8) toggle(p.deEsserEnabled, "deEsserEnabled");
             else if (selected == 200)
             {
                 const auto enabled = !audioEngine.isSmartMaskingEnabled();
@@ -435,7 +482,7 @@ void MainComponent::resized()
     spectrum.setBounds(spectrumArea);
 
     bounds.removeFromTop(10);
-    auto central = bounds.removeFromTop(std::max(300, bounds.getHeight() - 168));
+    auto central = bounds.removeFromTop(std::max(300, bounds.getHeight() - 120));
     cardBounds[2] = central.removeFromLeft(static_cast<int>(static_cast<float>(central.getWidth()) * 0.57f));
     central.removeFromLeft(10);
     cardBounds[3] = central;
@@ -460,17 +507,21 @@ void MainComponent::resized()
     }
     smart.removeFromTop(5);
     auto buttons = smart.removeFromTop(38);
-    const auto buttonWidth = (buttons.getWidth() - 16) / 3;
+    const auto buttonWidth = (buttons.getWidth() - 24) / 4;
     autoTuneButton.setBounds(buttons.removeFromLeft(buttonWidth));
     buttons.removeFromLeft(8);
     abButton.setBounds(buttons.removeFromLeft(buttonWidth));
     buttons.removeFromLeft(8);
-    bypassButton.setBounds(buttons);
+    bypassButton.setBounds(buttons.removeFromLeft(buttonWidth));
+    buttons.removeFromLeft(8);
+    resetDspButton.setBounds(buttons);
 
     auto measurements = cardBounds[3].reduced(18, 12);
     measurementsTitle.setBounds(measurements.removeFromTop(24));
-    auto metricArea = measurements.removeFromTop(122);
-    auto metrics = metricArea.removeFromTop(61);
+    qualityPanel.setBounds(measurements.removeFromTop(178));
+    measurements.removeFromTop(6);
+    auto metricArea = measurements.removeFromTop(104);
+    auto metrics = metricArea.removeFromTop(52);
     const auto metricWidth = metrics.getWidth() / 4;
     for (size_t index = 0; index < metricNames.size(); ++index)
     {
@@ -488,18 +539,22 @@ void MainComponent::resized()
     auto routing = cardBounds[4].reduced(18, 10);
     auto routingHeader = routing.removeFromTop(22);
     routingTitle.setBounds(routingHeader.removeFromLeft(150));
+    analystButton.setBounds(routingHeader.removeFromRight(145).reduced(0, 1));
     formatLabel.setBounds(routingHeader.removeFromLeft(220));
     latencyLabel.setBounds(routingHeader.removeFromLeft(160));
     diagnosticsLabel.setBounds(routingHeader);
     auto message = routing.removeFromBottom(26);
     messageLabel.setBounds(message);
 
-    // Three bounded columns keep every routing/OBS control usable at the
+    // Four bounded columns keep every routing/OBS/X32 control usable at the
     // minimum 1080 px window width and at common Windows DPI scales.
-    auto toggles = routing.removeFromRight(190);
+    auto x32Block = routing.removeFromRight(240);
     routing.removeFromRight(10);
+    auto toggles = routing.removeFromRight(180);
+    routing.removeFromRight(8);
     auto actions = routing.removeFromRight(390);
     routing.removeFromRight(12);
+    x32Panel.setBounds(x32Block);
     startWithWindows.setBounds(toggles.removeFromTop(28));
     startMinimized.setBounds(toggles.removeFromTop(28));
     churchNameEditor.setBounds(toggles.removeFromTop(34).reduced(0, 3));
@@ -719,6 +774,7 @@ void MainComponent::updateLiveValues()
     outputMeter.setLevels(output.getPeak(0), output.getPeak(1), output.getRms(0), output.getRms(1));
     const auto analysis = audioEngine.getAnalysisEngine().getSnapshot();
     const auto smart = audioEngine.getSmartEngine().getState();
+    x32Panel.setState(audioEngine.getX32State(), audioEngine.getAutoRouteSnapshot());
     if (analysis.analyzedFrames != lastSpectrumAnalyzedFrames)
     {
         lastSpectrumAnalyzedFrames = analysis.analyzedFrames;
@@ -756,6 +812,7 @@ void MainComponent::updateLiveValues()
     measurementsTitle.setText("STREAM QUALITY  " + juce::String(static_cast<int>(std::round(smart.quality.overall)))
                                   + " / 100  |  " + sceneName(smart.scene),
                               juce::dontSendNotification);
+    qualityPanel.setScores(smart.quality);
 
     juce::String actions;
     for (int index = 0; index < smart.problemCount; ++index)
@@ -914,6 +971,10 @@ void MainComponent::updateDspControls()
     parameters.compressorEnabled.store(settings.getNumber("compressorEnabled", 1.0) > 0.5, std::memory_order_release);
     parameters.saturationEnabled.store(settings.getNumber("saturationEnabled", 1.0) > 0.5, std::memory_order_release);
     parameters.limiterEnabled.store(settings.getNumber("limiterEnabled", 1.0) > 0.5, std::memory_order_release);
+    parameters.dynamicEqEnabled.store(settings.getNumber("dynamicEqEnabled", 1.0) > 0.5,
+                                      std::memory_order_release);
+    parameters.deEsserEnabled.store(settings.getNumber("deEsserEnabled", 1.0) > 0.5,
+                                    std::memory_order_release);
     parameters.broadcastLevelerEnabled.store(settings.getNumber("broadcastLevelerEnabled", 1.0) > 0.5,
                                               std::memory_order_release);
     presetSelector.onChange = [this]
@@ -955,6 +1016,44 @@ void MainComponent::updateDspControls()
     bypassButton.onClick = [this, &parameters]
     {
         parameters.bypass.store(bypassButton.getToggleState(), std::memory_order_release);
+    };
+    resetDspButton.onClick = [this, &parameters]
+    {
+        // Restore tone controls to factory defaults and clear the Smart
+        // Engine's adaptive corrections so the operator starts clean.
+        const struct { juce::Slider* slider; std::atomic<float>* target; const char* key; double value; float scale; }
+        defaults[] = {
+            { &cleanSlider,    &parameters.clean,          "clean",          50.0, 0.01f },
+            { &punchSlider,    &parameters.punch,          "punch",          50.0, 0.01f },
+            { &claritySlider,  &parameters.clarity,        "clarity",        50.0, 0.01f },
+            { &dynamicsSlider, &parameters.dynamics,       "dynamics",       50.0, 0.01f },
+            { &warmthSlider,   &parameters.warmth,         "warmth",         35.0, 0.01f },
+            { &loudnessSlider, &parameters.loudnessTarget, "loudnessTarget", -14.0, 1.0f },
+        };
+        suppressDspCallbacks = true;
+        for (const auto& entry : defaults)
+        {
+            entry.slider->setValue(entry.value, juce::dontSendNotification);
+            entry.target->store(static_cast<float>(entry.value) * entry.scale, std::memory_order_release);
+            settings.setNumber(entry.key, entry.value);
+        }
+        suppressDspCallbacks = false;
+
+        auto& adaptive = audioEngine.getProcessingEngine().getAdaptiveTargets();
+        adaptive.rumbleCutoffHz.store(20.0f, std::memory_order_release);
+        adaptive.lowGainDb.store(0.0f, std::memory_order_release);
+        adaptive.mudGainDb.store(0.0f, std::memory_order_release);
+        adaptive.clarityGainDb.store(0.0f, std::memory_order_release);
+        adaptive.harshGainDb.store(0.0f, std::memory_order_release);
+        adaptive.sibilanceGainDb.store(0.0f, std::memory_order_release);
+        adaptive.highGainDb.store(0.0f, std::memory_order_release);
+        adaptive.compressionDb.store(0.0f, std::memory_order_release);
+        adaptive.loudnessGainDb.store(0.0f, std::memory_order_release);
+        adaptive.stereoWidth.store(1.0f, std::memory_order_release);
+        adaptive.stereoBalanceDb.store(0.0f, std::memory_order_release);
+
+        settings.flush();
+        showResult({}, "DSP reset to defaults; Smart corrections cleared");
     };
 }
 
