@@ -83,6 +83,10 @@ private:
     std::array<float, maximumChannels> dcPreviousInput {};
     std::array<float, maximumChannels> dcPreviousOutput {};
     TruePeakDetector truePeakDetector;
+    // These detectors receive the already-split crossover groups below. They
+    // intentionally do not own filters or an alternate split tree.
+    static constexpr int multibandLimiterBandCount = 3;
+    std::array<TruePeakDetector, multibandLimiterBandCount> multibandTruePeakDetectors;
 
     // Fourth-order Butterworth, as two cascaded sections. Second order at
     // 20 Hz was doing essentially nothing about what actually dirties a church
@@ -113,7 +117,10 @@ private:
     // shifted, and at half the corner frequency the two paths cancel to only
     // -4 dB instead of the -15 dB the magnitude response suggests. A real
     // high-pass in cascade gives 24 dB/octave with no such surprise.
-    std::array<Biquad, 2> sideBassFilters;
+    // Two Linkwitz-Riley fourth-order sections in a row (48 dB/oct): the low
+    // Side has to be gone before a phone speaker cancels it, while the high
+    // Side keeps its presence untouched.
+    std::array<Biquad, 4> sideBassFilters;
 
     juce::dsp::LinkwitzRileyFilter<float> middleSplit;
     juce::dsp::LinkwitzRileyFilter<float> lowSplit;
@@ -161,6 +168,8 @@ private:
     float limiterWindowMinimum = 1.0f;
     float limiterSmoothedGain = 1.0f;
     float limiterSmoothingCoefficient = 0.0f;
+    std::array<float, multibandLimiterBandCount> multibandLimiterGain { 1.0f, 1.0f, 1.0f };
+    std::array<float, multibandLimiterBandCount> lastMultibandLimiterReduction {};
     // Blocks DC without also removing the bottom octave. The old fixed 0.995
     // was a first-order high-pass at about 38 Hz at 48 kHz, which is real
     // tonal shaping hiding inside something named after a safety measure, and

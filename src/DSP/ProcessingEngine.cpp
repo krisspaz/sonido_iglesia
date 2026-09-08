@@ -10,6 +10,7 @@ namespace
 // A 0.1 dB control margin keeps the rendered signal below the public -1 dBTP
 // ceiling despite release interpolation and floating-point filter tolerance.
 constexpr float limiterCeiling = 0.88104887f;
+constexpr float multibandMinimumCeiling = limiterCeiling;
 
 // Watchdog thresholds. Real programme stays far below both: the limiter holds
 // -1 dBTP and the saturator is bounded, so +18 dBFS on the processed path can
@@ -164,10 +165,11 @@ void ProcessingEngine::prepare(double newSampleRate, int maximumBlockSize, int c
     oversamplerLatencySamples = static_cast<int>(std::llround(oversampling.getLatencyInSamples()));
     oversamplerLatencySamples = std::max(0, oversamplerLatencySamples);
     lineLength = std::min(lookaheadSamples + oversamplerLatencySamples, maximumLookaheadSamples - 1);
-    // One oversampler latency shorter, so the wet lane (which the oversampler
-    // already delayed) and the dry lane both present their sample one
-    // `lineLength` after it arrived.
-    wetDelayLength = std::max(1, lineLength - oversamplerLatencySamples);
+    // The oversampler's latency is already inside the zero-indexed block it
+    // hands back, so the wet lane and the dry lane both present their sample
+    // one `lineLength` after it arrived; taking `oversamplerLatencySamples`
+    // off here would make the wet route arrive early by exactly that amount.
+    wetDelayLength = lineLength;
     dryBuffer.setSize(preparedChannels, preparedBlockSize, false, true, false);
     preSaturationBuffer.setSize(maximumChannels, preparedBlockSize, false, true, false);
 
@@ -249,6 +251,8 @@ void ProcessingEngine::resetProcessingState() noexcept
     for (auto& channel : wetDelay)
         channel.fill(0.0f);
     truePeakDetector.reset();
+    for (auto& detector : multibandTruePeakDetectors)
+        detector.reset();
     oversampling.reset();
     preSaturationBuffer.clear();
     dcPreviousInput.fill(0.0f);
@@ -286,6 +290,8 @@ void ProcessingEngine::resetProcessingState() noexcept
     limiterHistoryPosition = 0;
     limiterWindowMinimum = 1.0f;
     limiterSmoothedGain = 1.0f;
+    multibandLimiterGain.fill(1.0f);
+    lastMultibandLimiterReduction.fill(0.0f);
     lastCompressorReduction = 0.0f;
     lastLimiterReduction = 0.0f;
     programmeLevelSquare = 0.0f;
@@ -324,6 +330,9 @@ void ProcessingEngine::reset() noexcept
     metrics.failsafeActive.store(false, std::memory_order_relaxed);
     metrics.compressorGainReductionDb.store(0.0f, std::memory_order_relaxed);
     metrics.limiterGainReductionDb.store(0.0f, std::memory_order_relaxed);
+    metrics.multibandLimiterLowReductionDb.store(0.0f, std::memory_order_relaxed);
+    metrics.multibandLimiterMidReductionDb.store(0.0f, std::memory_order_relaxed);
+    metrics.multibandLimiterHighReductionDb.store(0.0f, std::memory_order_relaxed);
     metrics.truePeakEstimate.store(0.0f, std::memory_order_relaxed);
     metrics.abMatchGainDb.store(0.0f, std::memory_order_relaxed);
     metrics.broadcastLevelGainDb.store(0.0f, std::memory_order_relaxed);
@@ -355,6 +364,27 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
     const auto deEsserIsEnabled = eqEnabled
         && parameters.deEsserEnabled.load(std::memory_order_relaxed);
     const auto limiterIsEnabled = parameters.limiterEnabled.load(std::memory_order_relaxed);
+    const auto multibandLimiterIsEnabled = parameters.multibandLimiterEnabled.load(std::memory_order_relaxed);
+    const std::array<bool, multibandLimiterBandCount> multibandLimiterEnabled {
+        parameters.multibandLimiterLowEnabled.load(std::memory_order_relaxed),
+        parameters.multibandLimiterMidEnabled.load(std::memory_order_relaxed),
+        parameters.multibandLimiterHighEnabled.load(std::memory_order_relaxed)
+    };
+    const std::array<float, multibandLimiterBandCount> multibandLimiterCeiling {
+        std::clamp(parameters.multibandLimiterLowCeiling.load(std::memory_order_relaxed), multibandMinimumCeiling, 1.5f),
+        std::clamp(parameters.multibandLimiterMidCeiling.load(std::memory_order_relaxed), multibandMinimumCeiling, 1.5f),
+        std::clamp(parameters.multibandLimiterHighCeiling.load(std::memory_order_relaxed), multibandMinimumCeiling, 1.5f)
+    };
+    const std::array<float, multibandLimiterBandCount> multibandLimiterAttackMs {
+        std::clamp(parameters.multibandLimiterLowAttackMs.load(std::memory_order_relaxed), 0.1f, 10.0f),
+        std::clamp(parameters.multibandLimiterMidAttackMs.load(std::memory_order_relaxed), 0.1f, 10.0f),
+        std::clamp(parameters.multibandLimiterHighAttackMs.load(std::memory_order_relaxed), 0.1f, 10.0f)
+    };
+    const std::array<float, multibandLimiterBandCount> multibandLimiterReleaseMs {
+        std::clamp(parameters.multibandLimiterLowReleaseMs.load(std::memory_order_relaxed), 10.0f, 1000.0f),
+        std::clamp(parameters.multibandLimiterMidReleaseMs.load(std::memory_order_relaxed), 10.0f, 1000.0f),
+        std::clamp(parameters.multibandLimiterHighReleaseMs.load(std::memory_order_relaxed), 10.0f, 1000.0f)
+    };
     const auto levelerIsEnabled = parameters.broadcastLevelerEnabled.load(std::memory_order_relaxed);
     // One setpoint, the operator's. Clamped only to keep an absurd stored value
     // out of the gain path.
@@ -408,6 +438,13 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
     const auto saturationDrive = 1.0f + warmth * 0.16f;
     const auto saturationNormaliser = 1.0f / std::tanh(saturationDrive);
     const auto limiterRelease = std::exp(-1.0f / static_cast<float>(sampleRate * 0.080));
+    std::array<float, multibandLimiterBandCount> multibandLimiterAttack {};
+    std::array<float, multibandLimiterBandCount> multibandLimiterRelease {};
+    for (size_t band = 0; band < multibandLimiterBandCount; ++band)
+    {
+        multibandLimiterAttack[band] = std::exp(-1.0f / static_cast<float>(sampleRate * multibandLimiterAttackMs[band] * 0.001f));
+        multibandLimiterRelease[band] = std::exp(-1.0f / static_cast<float>(sampleRate * multibandLimiterReleaseMs[band] * 0.001f));
+    }
     // The leveler gain still ramps, but only enough to stop zipper noise: the
     // Kalman estimate it follows is already smooth by construction.
     const auto levelGainSmoothing = std::exp(-1.0f / static_cast<float>(sampleRate * 0.020));
@@ -417,6 +454,7 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
     auto blockMaxDeEsser = 0.0f;
     auto blockMaxDynamicEq = 0.0f;
     auto blockMaxLimiterReduction = 0.0f;
+    std::array<float, multibandLimiterBandCount> blockMaxMultibandLimiterReduction {};
     auto blockTruePeak = 0.0f;
     const auto processedSelected = !parameters.bypass.load(std::memory_order_relaxed)
         && parameters.abProcessed.load(std::memory_order_relaxed);
@@ -555,6 +593,50 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
             blockMaxMakeup = std::max(blockMaxMakeup, makeup);
         }
 
+        // Reuse the compressor crossover tree as three limiter groups. The
+        // low group intentionally shares one gain across its two constituent
+        // bands so a 120 Hz crossover boundary cannot move with gain.
+        if (multibandLimiterIsEnabled)
+        {
+            std::array<float, multibandLimiterBandCount> multibandGroupPeak {};
+            for (int channel = 0; channel < activeChannels; ++channel)
+            {
+                const std::array<float, multibandLimiterBandCount> groups {
+                    bands[channel][0] * appliedBandGain[0] + bands[channel][1] * appliedBandGain[1],
+                    bands[channel][2] * appliedBandGain[2],
+                    bands[channel][3] * appliedBandGain[3]
+                };
+                for (size_t band = 0; band < multibandLimiterBandCount; ++band)
+                {
+                    // The immediate sample peak removes the detector's FIR delay
+                    // from the attack decision; the 4x detector catches the
+                    // inter-sample interval once its history is available.
+                    const auto detected = std::max(std::abs(groups[band]),
+                        multibandTruePeakDetectors[band].process(channel, groups[band]));
+                    multibandGroupPeak[band] = std::max(multibandGroupPeak[band], detected);
+                }
+            }
+            for (size_t band = 0; band < multibandLimiterBandCount; ++band)
+            {
+                const auto target = multibandLimiterEnabled[band]
+                    ? std::min(1.0f, multibandLimiterCeiling[band] / std::max(multibandGroupPeak[band], 1.0e-9f))
+                    : 1.0f;
+                const auto coefficient = target < multibandLimiterGain[band]
+                    ? multibandLimiterAttack[band] : multibandLimiterRelease[band];
+                multibandLimiterGain[band] = coefficient * multibandLimiterGain[band]
+                    + (1.0f - coefficient) * target;
+                blockMaxMultibandLimiterReduction[band] = std::max(blockMaxMultibandLimiterReduction[band],
+                    std::max(0.0f, -gainToDecibels(multibandLimiterGain[band], -60.0f)));
+            }
+        }
+        else
+        {
+            // Do not touch detector or gain state while bypassed. This keeps
+            // the legacy path bit-for-bit identical and makes enable a clean
+            // opt-in rather than an always-running hidden processor.
+            multibandLimiterGain.fill(1.0f);
+        }
+
         const auto blockOutputGain = outputGain.getNextValue();
         for (int channel = 0; channel < activeChannels; ++channel)
         {
@@ -567,8 +649,11 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
             // the 4x oversampler now owns that job, and saturating the complete
             // wet path is what actually sounds like a console drive stage on a
             // full mix instead of only its bottom two thirds.
-            const auto value = lowGroupPhase.processSample(channel, compressedLowGroup)
-                + highGroupPhase.processSample(channel, compressedMid + compressedTop);
+            const auto value = lowGroupPhase.processSample(channel,
+                                                             compressedLowGroup * multibandLimiterGain[0])
+                + highGroupPhase.processSample(channel,
+                                                compressedMid * multibandLimiterGain[1]
+                                                + compressedTop * multibandLimiterGain[2]);
             preSaturationBuffer.setSample(channel, sampleIndex, value * blockOutputGain);
         }
     }
@@ -581,13 +666,18 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
     {
         auto block = juce::dsp::AudioBlock<float>(preSaturationBuffer)
             .getSubBlock(0, static_cast<size_t>(numSamples));
-        // TEMP-NEGATIVE-CHECK
-        for (int channel = 0; channel < maximumChannels; ++channel)
+        const auto upsampled = oversampling.processSamplesUp(block);
+        if (saturationIsEnabled)
         {
-            auto* samples = preSaturationBuffer.getWritePointer(channel);
-            for (int i = 0; i < numSamples; ++i)
-                samples[i] = std::tanh(samples[i] * saturationDrive) * saturationNormaliser;
+            const auto upsampledSamples = static_cast<int>(upsampled.getNumSamples());
+            for (int ch = 0; ch < maximumChannels; ++ch)
+            {
+                auto* samples = upsampled.getChannelPointer(static_cast<size_t>(ch));
+                for (int i = 0; i < upsampledSamples; ++i)
+                    samples[i] = std::tanh(samples[i] * saturationDrive) * saturationNormaliser;
+            }
         }
+        oversampling.processSamplesDown(block);
     }
 
     for (int sampleIndex = 0; sampleIndex < numSamples; ++sampleIndex)
@@ -820,6 +910,8 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
                                               dynamicBands[dynamicHarsh].getReductionDb()));
 
         auto faulted = !std::isfinite(limiterGain) || !std::isfinite(limiterSmoothedGain);
+        for (const auto gain : multibandLimiterGain)
+            faulted = faulted || !std::isfinite(gain);
         for (int channel = 0; channel < activeChannels; ++channel)
             faulted = faulted || !std::isfinite(wet[channel])
                 || std::abs(wet[channel]) > failsafeMagnitude;
@@ -891,8 +983,14 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
 
     lastCompressorReduction = std::max(blockMaxCompressorReduction, lastCompressorReduction * 0.92f);
     lastLimiterReduction = std::max(blockMaxLimiterReduction, lastLimiterReduction * 0.90f);
+    for (size_t band = 0; band < multibandLimiterBandCount; ++band)
+        lastMultibandLimiterReduction[band] = std::max(blockMaxMultibandLimiterReduction[band],
+                                                       lastMultibandLimiterReduction[band] * 0.90f);
     metrics.compressorGainReductionDb.store(lastCompressorReduction, std::memory_order_release);
     metrics.limiterGainReductionDb.store(lastLimiterReduction, std::memory_order_release);
+    metrics.multibandLimiterLowReductionDb.store(lastMultibandLimiterReduction[0], std::memory_order_release);
+    metrics.multibandLimiterMidReductionDb.store(lastMultibandLimiterReduction[1], std::memory_order_release);
+    metrics.multibandLimiterHighReductionDb.store(lastMultibandLimiterReduction[2], std::memory_order_release);
     metrics.truePeakEstimate.store(blockTruePeak, std::memory_order_release);
     metrics.appliedOutputGainDb.store(gainToDecibels(outputGain.getCurrentValue()), std::memory_order_release);
     metrics.deEsserReductionDb.store(blockMaxDeEsser, std::memory_order_release);
@@ -958,13 +1056,18 @@ void ProcessingEngine::updateTargets(int numSamples) noexcept
     warmthGain.setTargetValue(std::clamp(warmth * 2.5f, 0.0f, 2.5f));
     lowGain.setTargetValue(smart ? std::clamp(adaptiveTargets.lowGainDb.load(std::memory_order_relaxed), autoMode ? -2.0f : -1.5f, 0.5f) : 0.0f);
     mudGain.setTargetValue(std::clamp(-clean * 0.8f
-                                         + (smart ? adaptiveTargets.mudGainDb.load(std::memory_order_relaxed) : 0.0f),
+                                         + (smart ? adaptiveTargets.mudGainDb.load(std::memory_order_relaxed) : 0.0f)
+                                         + parameters.analystMudOffsetDb.load(std::memory_order_relaxed),
                                      autoMode ? -3.0f : -2.0f, 0.0f));
     clarityGain.setTargetValue(std::clamp(clarity * 1.8f
                                              + (smart ? adaptiveTargets.clarityGainDb.load(std::memory_order_relaxed) : 0.0f),
                                          -0.5f, autoMode ? 3.5f : 3.0f));
-    harshGain.setTargetValue(smart ? std::clamp(adaptiveTargets.harshGainDb.load(std::memory_order_relaxed), autoMode ? -3.0f : -2.0f, 0.0f) : 0.0f);
-    sibilanceGain.setTargetValue(smart ? std::clamp(adaptiveTargets.sibilanceGainDb.load(std::memory_order_relaxed), autoMode ? -4.0f : -2.5f, 0.0f) : 0.0f);
+    harshGain.setTargetValue(std::clamp((smart ? adaptiveTargets.harshGainDb.load(std::memory_order_relaxed) : 0.0f)
+                                        + parameters.analystHarshOffsetDb.load(std::memory_order_relaxed),
+                                        autoMode ? -3.0f : -2.0f, 0.0f));
+    sibilanceGain.setTargetValue(std::clamp((smart ? adaptiveTargets.sibilanceGainDb.load(std::memory_order_relaxed) : 0.0f)
+                                            + parameters.analystSibilanceOffsetDb.load(std::memory_order_relaxed),
+                                            autoMode ? -4.0f : -2.5f, 0.0f));
     // The air shelf carries both the user's CLARITY and the Smart Engine's
     // high-frequency correction, so a bright room can be smoothed and a dull
     // one can be opened up with the same control instead of only the former.

@@ -20,3 +20,9 @@ Luego abre `http://127.0.0.1:8765/docs` en la PC. Esta primera versión escucha 
 Además expone `/reference-match`, `/feedback`, `/learning` y `DELETE /learning`. El historial SQLite contiene únicamente métricas y decisiones del operador; nunca guarda audio.
 
 Para FLAC/AIFF y LUFS EBU R128 instala `.[analysis]`. Whisper y Demucs siguen siendo módulos opcionales para transcripción/separación; no se ejecutan en la ruta de audio en vivo.
+
+## Paquete Windows
+
+El build de Windows ejecuta `scripts/package-church-sound-analyst.ps1`, crea `dist/app/ChurchSoundAnalyst/ChurchSoundAnalyst.exe` y el instalador lo instala junto a la aplicación. En Windows, Church Stream Processor lo inicia como proceso auxiliar local con el token de `%APPDATA%\\ChurchStreamProcessor\\church-sound-analyst.token`. Si el servicio no inicia, el DSP C++ continúa sin cambios.
+
+El menú `ANALYZE PYTHON` permite analizar, comparar una referencia, solicitar Whisper/Demucs, revisar recomendaciones, aplicarlas con confirmación y calificar una sesión. La aplicación al DSP está acotada a ±3 dB para EQ dinámica y a -18…-10 LUFS para el objetivo de loudness.

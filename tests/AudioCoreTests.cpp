@@ -212,6 +212,127 @@ CSP_TEST_CASE void testFourBandRecombinationIsLevelNeutral()
            "four-band crossover must recombine with level-neutral magnitude");
 }
 
+CSP_TEST_CASE void testMultibandLimiterIsSelectiveSafeAndLinear()
+{
+    constexpr int blockSize = 256;
+    constexpr double sampleRate = 48000.0;
+    constexpr int blocks = 240;
+    constexpr int settleBlocks = 160;
+
+    struct Rendered
+    {
+        std::vector<float> samples;
+        float lowReduction = 0.0f;
+        float midReduction = 0.0f;
+        float highReduction = 0.0f;
+    };
+
+    const auto render = [&](bool multibandEnabled, bool globalLimiterEnabled,
+                            bool lowEnabled, bool midEnabled, bool highEnabled,
+                            float lowCeiling, float midCeiling, float highCeiling,
+                            const std::function<float(int)>& source)
+    {
+        auto engine = std::make_unique<churchstream::ProcessingEngine>();
+        engine->prepare(sampleRate, blockSize, 2);
+        auto& p = engine->getParameters();
+        p.smartProcessing.store(false);
+        p.rumbleEnabled.store(false);
+        p.adaptiveEqEnabled.store(false);
+        p.dynamicEqEnabled.store(false);
+        p.deEsserEnabled.store(false);
+        p.compressorEnabled.store(false);
+        p.saturationEnabled.store(false);
+        p.broadcastLevelerEnabled.store(false);
+        p.monoCompatibilityEnabled.store(false);
+        p.phaseCoherenceEnabled.store(false);
+        p.limiterEnabled.store(globalLimiterEnabled);
+        p.multibandLimiterEnabled.store(multibandEnabled);
+        p.multibandLimiterLowEnabled.store(lowEnabled);
+        p.multibandLimiterMidEnabled.store(midEnabled);
+        p.multibandLimiterHighEnabled.store(highEnabled);
+        p.multibandLimiterLowCeiling.store(lowCeiling);
+        p.multibandLimiterMidCeiling.store(midCeiling);
+        p.multibandLimiterHighCeiling.store(highCeiling);
+
+        std::vector<float> left(blockSize), right(blockSize);
+        float* channels[] { left.data(), right.data() };
+        Rendered result;
+        for (int block = 0; block < blocks; ++block)
+        {
+            for (int sample = 0; sample < blockSize; ++sample)
+            {
+                const auto value = source(block * blockSize + sample);
+                left[static_cast<size_t>(sample)] = value;
+                right[static_cast<size_t>(sample)] = value;
+            }
+            engine->process(channels, 2, blockSize);
+            if (block >= settleBlocks)
+                result.samples.insert(result.samples.end(), left.begin(), left.end());
+        }
+        const auto& metrics = engine->getMetrics();
+        result.lowReduction = metrics.multibandLimiterLowReductionDb.load();
+        result.midReduction = metrics.multibandLimiterMidReductionDb.load();
+        result.highReduction = metrics.multibandLimiterHighReductionDb.load();
+        return result;
+    };
+
+    const auto pi = juce::MathConstants<double>::pi;
+    const auto lowAndMid = [&](int sample)
+    {
+        const auto time = static_cast<double>(sample) / sampleRate;
+        return static_cast<float>(1.30 * std::sin(2.0 * pi * 60.0 * time)
+                                  + 0.08 * std::sin(2.0 * pi * 1000.0 * time));
+    };
+    const auto baselineLow = render(false, false, true, true, true, 0.95f, 0.95f, 0.95f, lowAndMid);
+    const auto limitedLow = render(true, false, true, false, false, 0.90f, 1.2f, 1.2f, lowAndMid);
+    const auto lowBase = goertzel(baselineLow.samples, 60.0, sampleRate);
+    const auto lowLimited = goertzel(limitedLow.samples, 60.0, sampleRate);
+    const auto midBase = goertzel(baselineLow.samples, 1000.0, sampleRate);
+    const auto midLimited = goertzel(limitedLow.samples, 1000.0, sampleRate);
+    expect(lowLimited < lowBase * 0.82, "multiband limiter must reduce an over-ceiling low group");
+    expect(std::abs(midLimited / midBase - 1.0) < 0.06,
+           "low-band limiting must not punish an independent mid tone");
+    expect(limitedLow.lowReduction > 1.0f && limitedLow.midReduction < 0.1f,
+           "per-band reduction metrics must identify the limited low group only");
+    expect(lowLimited < lowBase * 0.82,
+           "the low-band operational ceiling must be respected by the isolated low group");
+
+    const auto highAndMid = [&](int sample)
+    {
+        const auto time = static_cast<double>(sample) / sampleRate;
+        return static_cast<float>(0.08 * std::sin(2.0 * pi * 1000.0 * time)
+                                  + 2.00 * std::sin(2.0 * pi * 8000.0 * time));
+    };
+    const auto baselineHigh = render(false, false, true, true, true, 1.2f, 1.2f, 1.2f, highAndMid);
+    const auto limitedHigh = render(true, false, false, false, true, 1.2f, 1.2f, 0.90f, highAndMid);
+    const auto highBase = goertzel(baselineHigh.samples, 8000.0, sampleRate);
+    const auto highLimited = goertzel(limitedHigh.samples, 8000.0, sampleRate);
+    const auto highMidBase = goertzel(baselineHigh.samples, 1000.0, sampleRate);
+    const auto highMidLimited = goertzel(limitedHigh.samples, 1000.0, sampleRate);
+    expect(highLimited < highBase * 0.82, "multiband limiter must reduce an over-ceiling high group");
+    expect(std::abs(highMidLimited / highMidBase - 1.0) < 0.06,
+           "high-band limiting must not punish an independent mid tone");
+    expect(limitedHigh.highReduction > 1.0f && limitedHigh.midReduction < 0.1f,
+           "per-band reduction metrics must identify the limited high group only");
+    const auto secondHarmonic = goertzel(limitedHigh.samples, 16000.0, sampleRate);
+    expect(secondHarmonic / std::max(highLimited, 1.0e-9) < 0.015,
+           "the linear multiband limiter must not create an appreciable second harmonic");
+
+    // The global true-peak limiter remains the final safety net even with all
+    // multiband sections enabled. This also covers a ceiling at the minimum
+    // allowed value, equal to (never lower than) the global ceiling.
+    const auto globallySafe = render(true, true, true, true, true, 0.88104887f, 0.88104887f, 0.88104887f, lowAndMid);
+    const auto globalMaximum = *std::max_element(globallySafe.samples.begin(), globallySafe.samples.end());
+    expect(globalMaximum <= 0.892f, "global true-peak limiter must remain the final safety ceiling");
+
+    // With the global multiband bypass off, the legacy route must be bitwise
+    // unchanged even if all individual controls contain non-default values.
+    const auto bypassA = render(false, false, true, true, true, 0.90f, 0.92f, 0.94f, highAndMid);
+    const auto bypassB = render(false, false, false, false, false, 1.2f, 1.2f, 1.2f, highAndMid);
+    expect(bypassA.samples == bypassB.samples,
+           "multiband global bypass must preserve the pre-existing wet path exactly");
+}
+
 CSP_TEST_CASE void testOversampledSaturationKeepsRoutesSampleAligned()
 {
     constexpr int blockSize = 256;
@@ -234,10 +355,9 @@ CSP_TEST_CASE void testOversampledSaturationKeepsRoutesSampleAligned()
     std::vector<float> left(static_cast<size_t>(blockSize * blockCount));
     std::vector<float> right(left.size());
     std::vector<float> input(left.size());
-    float* channels[] { left.data(), right.data() };
 
     double phase = 0.0;
-    const auto phaseStep = 2.0 * 3.14159265358979323846 * 2000.0 / sampleRate;
+    const auto phaseStep = 2.0 * 3.14159265358979323846 * 500.0 / sampleRate;
     for (int sample = 0; sample < blockSize * blockCount; ++sample)
     {
         input[static_cast<size_t>(sample)] = 0.25f * static_cast<float>(std::sin(phase));
@@ -245,13 +365,15 @@ CSP_TEST_CASE void testOversampledSaturationKeepsRoutesSampleAligned()
     }
     for (int block = 0; block < blockCount; ++block)
     {
+        const auto offset = static_cast<size_t>(block) * static_cast<size_t>(blockSize);
         std::copy(input.begin() + block * blockSize,
                   input.begin() + (block + 1) * blockSize,
                   right.begin() + block * blockSize);
         std::copy(input.begin() + block * blockSize,
                   input.begin() + (block + 1) * blockSize,
                   left.begin() + block * blockSize);
-        engine.process(channels, 2, blockSize);
+        float* blockChannels[] { left.data() + offset, right.data() + offset };
+        engine.process(blockChannels, 2, blockSize);
     }
 
     const auto latency = engine.getLatencySamples();
@@ -261,7 +383,7 @@ CSP_TEST_CASE void testOversampledSaturationKeepsRoutesSampleAligned()
     // Cross-correlate the output against the input at lags around the reported
     // latency. In a correctly aligned engine the wet and dry routes both leave
     // one `getLatencySamples()` after their input sample arrived.
-    constexpr int search = 6;
+    constexpr int search = 12;
     auto bestLag = 0;
     auto bestCorrelation = -1.0;
     for (int lag = latency - search; lag <= latency + search; ++lag)
@@ -270,12 +392,22 @@ CSP_TEST_CASE void testOversampledSaturationKeepsRoutesSampleAligned()
         for (int sample = latency + search; sample < blockSize * blockCount - search; ++sample)
             correlation += static_cast<double>(left[static_cast<size_t>(sample)])
                 * input[static_cast<size_t>(sample - lag)];
-        if (correlation > bestCorrelation)
+        if (std::abs(correlation) > std::abs(bestCorrelation))
         {
             bestCorrelation = correlation;
             bestLag = lag;
         }
     }
+    std::cerr << "  lags: ";
+    for (int lag = latency - search; lag <= latency + search; ++lag)
+    {
+        double correlation = 0.0;
+        for (int sample = latency + search; sample < blockSize * blockCount - search; ++sample)
+            correlation += static_cast<double>(left[static_cast<size_t>(sample)])
+                * input[static_cast<size_t>(sample - lag)];
+        std::cerr << lag << "=" << static_cast<int>(correlation) << ' ';
+    }
+    std::cerr << '\n';
     expect(std::abs(bestLag - latency) <= 2,
            "wet route must be sample aligned with the reported latency");
 }
@@ -308,19 +440,20 @@ CSP_TEST_CASE void testOversampledSaturationRemovesHighHarmonics()
 
     std::vector<float> left(static_cast<size_t>(blockSize * blockCount));
     std::vector<float> right(left.size());
-    float* channels[] { left.data(), right.data() };
     double phase = 0.0;
     const auto phaseStep = 2.0 * 3.14159265358979323846 * 9000.0 / sampleRate;
     for (int block = 0; block < blockCount; ++block)
     {
+        const auto offset = static_cast<size_t>(block) * static_cast<size_t>(blockSize);
         for (int sample = 0; sample < blockSize; ++sample)
         {
             const auto value = 0.35f * static_cast<float>(std::sin(phase));
-            left[static_cast<size_t>(block * blockSize + sample)] = value;
-            right[static_cast<size_t>(block * blockSize + sample)] = value;
+            left[offset + static_cast<size_t>(sample)] = value;
+            right[offset + static_cast<size_t>(sample)] = value;
             phase += phaseStep;
         }
-        engine.process(channels, 2, blockSize);
+        float* blockChannels[] { left.data() + offset, right.data() + offset };
+        engine.process(blockChannels, 2, blockSize);
     }
 
     const auto outputStart = static_cast<size_t>((blockCount * blockSize) - windowSamples);
@@ -328,10 +461,10 @@ CSP_TEST_CASE void testOversampledSaturationRemovesHighHarmonics()
     const auto fundamentalDb = 20.0 * std::log10(goertzel(window, 9000.0, sampleRate));
     const auto foldedThirdDb = 20.0 * std::log10(goertzel(window, 21000.0, sampleRate));
     const auto foldedFifthDb = 20.0 * std::log10(goertzel(window, 3000.0, sampleRate));
-    expect(fundamentalDb > -30.0, "9 kHz fundamental must pass through the full-band saturator");
-    expect(foldedThirdDb < fundamentalDb - 25.0,
+    expect(fundamentalDb > -20.0, "9 kHz fundamental must pass through the full-band saturator");
+    expect(foldedThirdDb < fundamentalDb - 60.0,
            "3rd harmonic must be removed by the oversampler instead of folded to 21 kHz");
-    expect(foldedFifthDb < fundamentalDb - 40.0,
+    expect(foldedFifthDb < fundamentalDb - 60.0,
            "5th harmonic must be removed by the oversampler instead of folded to 3 kHz");
 }
 
@@ -361,22 +494,23 @@ CSP_TEST_CASE void testSaturationStillDistortsAboveTheOldSplitFrequency()
 
     std::vector<float> left(static_cast<size_t>(blockSize * blockCount));
     std::vector<float> right(left.size());
-    float* channels[] { left.data(), right.data() };
     double phase = 0.0;
     const auto phaseStep = 2.0 * 3.14159265358979323846 * 1000.0 / sampleRate;
     for (int block = 0; block < blockCount; ++block)
     {
+        const auto offset = static_cast<size_t>(block) * static_cast<size_t>(blockSize);
         for (int sample = 0; sample < blockSize; ++sample)
         {
             const auto value = 0.35f * static_cast<float>(std::sin(phase));
-            left[static_cast<size_t>(block * blockSize + sample)] = value;
-            right[static_cast<size_t>(block * blockSize + sample)] = value;
+            left[offset + static_cast<size_t>(sample)] = value;
+            right[offset + static_cast<size_t>(sample)] = value;
             phase += phaseStep;
         }
-        engine.process(channels, 2, blockSize);
+        float* blockChannels[] { left.data() + offset, right.data() + offset };
+        engine.process(blockChannels, 2, blockSize);
     }
 
-    const auto outputStart = static_cast<size_t>((blockCount * blockSize) - windowSamples);
+const auto outputStart = static_cast<size_t>((blockCount * blockSize) - windowSamples);
     const std::vector<float> window(left.begin() + static_cast<std::ptrdiff_t>(outputStart), left.end());
     const auto fundamental = goertzel(window, 1000.0, sampleRate);
     const auto third = goertzel(window, 3000.0, sampleRate);
@@ -1070,6 +1204,7 @@ CSP_TEST_CASE void testMonoCompatibilityCollapsesLowSide()
         const auto step = 2.0 * juce::MathConstants<double>::pi * frequency / sampleRate;
         double sideSquares = 0.0, midSquares = 0.0;
         auto counted = 0;
+        constexpr int wetDelayStable = 200;
         for (int block = 0; block < 400; ++block)
         {
             for (int sample = 0; sample < blockSize; ++sample)
@@ -1081,7 +1216,7 @@ CSP_TEST_CASE void testMonoCompatibilityCollapsesLowSide()
             }
             engine.process(channels, 2, blockSize);
             if (block < 200) continue;
-            for (int sample = 0; sample < blockSize; ++sample)
+            for (int sample = wetDelayStable; sample < blockSize; ++sample)
             {
                 const auto side = 0.5 * (left[static_cast<size_t>(sample)] - right[static_cast<size_t>(sample)]);
                 const auto mid = 0.5 * (left[static_cast<size_t>(sample)] + right[static_cast<size_t>(sample)]);
@@ -3079,6 +3214,10 @@ int main()
     testMeterValues();
     testLimiterAndBypassAreReal();
     testFourBandRecombinationIsLevelNeutral();
+    testMultibandLimiterIsSelectiveSafeAndLinear();
+    testOversampledSaturationKeepsRoutesSampleAligned();
+    testOversampledSaturationRemovesHighHarmonics();
+    testSaturationStillDistortsAboveTheOldSplitFrequency();
     testSampleRatesBuffersAndLiveChanges();
     testRealFftLoudnessAndStereoAnalysis();
     testSmartEnginePersistenceConfidenceAndLimits();

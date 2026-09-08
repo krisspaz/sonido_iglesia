@@ -65,6 +65,10 @@ private:
     void chooseRoomMeasurement();
     void applyBuiltInPreset(int presetIndex);
     void refreshUserPresets();
+    void showAnalystMenu();
+    void chooseAnalystRecording();
+    void applyAnalystRecommendations();
+    void sendAnalystFeedback(const juce::String& rating);
     void applySectionVisibility();
     [[nodiscard]] bool liveRoutingLocked() const;
     [[nodiscard]] int getVisibleRefreshRate() const;
@@ -149,6 +153,7 @@ private:
     juce::Label diagnosticsLabel;
     std::unique_ptr<juce::FileChooser> offlineFileChooser;
     std::unique_ptr<juce::FileChooser> analystFileChooser;
+    std::unique_ptr<juce::FileChooser> analystReferenceChooser;
     std::unique_ptr<juce::FileChooser> roomFileChooser;
     std::unique_ptr<juce::AlertWindow> consoleAddressWindow;
     std::unique_ptr<juce::FileChooser> presetFileChooser;
@@ -158,6 +163,8 @@ private:
     juce::StringArray inputDeviceNames;
     juce::StringArray outputDeviceNames;
     ChurchSoundAnalystClient analystClient;
+    juce::File analystSourceFile;
+    juce::var analystRecommendations;
     bool collapseSpectrum = false;
     bool collapseDsp = false;
     bool collapseRouting = false;

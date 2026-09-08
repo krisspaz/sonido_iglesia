@@ -18,11 +18,14 @@ public:
     ~ChurchSoundAnalystClient();
 
     void analyzeFile(const juce::File& file, Completion completion);
+    void request(const juce::String& endpoint, juce::var payload, Completion completion);
     [[nodiscard]] const juce::String& getToken() const noexcept { return token; }
 
 private:
+    void startBundledService();
     class Job;
     juce::ThreadPool pool { 1 };
+    juce::ChildProcess bundledService;
     juce::String token;
 };
 } // namespace churchstream

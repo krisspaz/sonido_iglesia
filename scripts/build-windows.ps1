@@ -24,6 +24,9 @@ New-Item -ItemType Directory -Force $DistApp | Out-Null
 Copy-Item $AppExe $DistApp -Force
 Copy-Item $BenchmarkExe $DistApp -Force
 
+& (Join-Path $ProjectRoot 'scripts/package-church-sound-analyst.ps1') -Output $DistApp
+if ($LASTEXITCODE -ne 0) { throw "Church Sound Analyst packaging failed with exit code $LASTEXITCODE" }
+
 $DriverInf = Join-Path $ProjectRoot 'dist/driver/ChurchStreamVirtual.inf'
 $DriverSys = Join-Path $ProjectRoot 'dist/driver/ChurchStreamVirtual.sys'
 $DriverCat = Join-Path $ProjectRoot 'dist/driver/ChurchStreamVirtual.cat'

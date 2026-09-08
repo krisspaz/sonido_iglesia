@@ -29,6 +29,7 @@ Name: "startminimized"; Description: "Start minimized in the system tray"; Group
 [Files]
 Source: "..\dist\app\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\app\ChurchStreamProcessorBenchmark.exe"; DestDir: "{app}\tools"; Flags: ignoreversion
+Source: "..\dist\app\ChurchSoundAnalyst\*"; DestDir: "{app}\ChurchSoundAnalyst"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "uninstall-virtual-driver.ps1"; DestDir: "{app}\driver"; Flags: ignoreversion
 #if DirExists("..\dist\driver")
 Source: "..\dist\driver\*"; DestDir: "{app}\driver"; Flags: ignoreversion recursesubdirs createallsubdirs

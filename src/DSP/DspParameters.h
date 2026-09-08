@@ -29,6 +29,12 @@ struct DspParameters final
     std::atomic<float> dynamics { 0.50f };
     std::atomic<float> warmth { 0.35f };
     std::atomic<float> loudnessTarget { -14.0f };
+    // Conservative offsets set only after an operator confirms an offline
+    // Church Sound Analyst recommendation. The real-time engine remains fully
+    // C++ and clamps these values before they reach a filter.
+    std::atomic<float> analystMudOffsetDb { 0.0f };
+    std::atomic<float> analystHarshOffsetDb { 0.0f };
+    std::atomic<float> analystSibilanceOffsetDb { 0.0f };
 
     std::atomic<bool> rumbleEnabled { true };
     std::atomic<bool> adaptiveEqEnabled { true };
@@ -40,6 +46,23 @@ struct DspParameters final
     std::atomic<bool> dynamicEqEnabled { true };
     std::atomic<bool> deEsserEnabled { true };
     std::atomic<bool> limiterEnabled { true };
+    // Optional three-band wet limiter. It uses the existing 0-500 Hz,
+    // 500-4 kHz and >4 kHz crossover groups; the full-band true-peak limiter
+    // remains the final safety net. Ceilings are linear amplitudes and are
+    // constrained by the engine to never sit below the global ceiling.
+    std::atomic<bool> multibandLimiterEnabled { false };
+    std::atomic<bool> multibandLimiterLowEnabled { true };
+    std::atomic<bool> multibandLimiterMidEnabled { true };
+    std::atomic<bool> multibandLimiterHighEnabled { true };
+    std::atomic<float> multibandLimiterLowCeiling { 0.95f };
+    std::atomic<float> multibandLimiterMidCeiling { 0.95f };
+    std::atomic<float> multibandLimiterHighCeiling { 0.95f };
+    std::atomic<float> multibandLimiterLowAttackMs { 1.0f };
+    std::atomic<float> multibandLimiterMidAttackMs { 1.0f };
+    std::atomic<float> multibandLimiterHighAttackMs { 1.0f };
+    std::atomic<float> multibandLimiterLowReleaseMs { 180.0f };
+    std::atomic<float> multibandLimiterMidReleaseMs { 120.0f };
+    std::atomic<float> multibandLimiterHighReleaseMs { 70.0f };
     // Stereo program leveler is enabled by the application setting. It is
     // separate from Smart Engine so it can safely stabilise a plain X32 L/R
     // stream even when the source has no isolated stems.
@@ -78,6 +101,9 @@ struct DspMetrics final
 {
     std::atomic<float> compressorGainReductionDb { 0.0f };
     std::atomic<float> limiterGainReductionDb { 0.0f };
+    std::atomic<float> multibandLimiterLowReductionDb { 0.0f };
+    std::atomic<float> multibandLimiterMidReductionDb { 0.0f };
+    std::atomic<float> multibandLimiterHighReductionDb { 0.0f };
     std::atomic<float> truePeakEstimate { 0.0f };
     std::atomic<float> appliedOutputGainDb { 0.0f };
     // What the dynamic sections are actually doing right now, so the operator

@@ -304,25 +304,7 @@ MainComponent::MainComponent(bool startAudio)
                                                  AppSettings::getDataDirectory().getChildFile("church-profile.json"));
         });
     };
-    analystButton.onClick = [this]
-    {
-        analystFileChooser = std::make_unique<juce::FileChooser>("Select recording for Church Sound Analyst",
-                                                                  juce::File(), "*.wav;*.flac;*.aif;*.aiff");
-        analystFileChooser->launchAsync(juce::FileBrowserComponent::openMode
-                                            | juce::FileBrowserComponent::canSelectFiles,
-                                        [this](const juce::FileChooser& chooser)
-        {
-            const auto file = chooser.getResult();
-            if (!file.existsAsFile()) return;
-            messageLabel.setText("Church Sound Analyst: analysing offline...", juce::dontSendNotification);
-            analystClient.analyzeFile(file, [this](bool ok, juce::String response)
-            {
-                messageLabel.setText(ok ? "Church Sound Analyst: report received (preview in JSON)"
-                                         : "Church Sound Analyst: " + response,
-                                     juce::dontSendNotification);
-            });
-        });
-    };
+    analystButton.onClick = [this] { showAnalystMenu(); };
     startWithWindows.onClick = [this]
     {
         const auto enabled = startWithWindows.getToggleState();
@@ -609,6 +591,177 @@ void MainComponent::resized()
 void MainComponent::setBypassed(bool shouldBypass)
 {
     bypassButton.setToggleState(shouldBypass, juce::sendNotification);
+}
+
+void MainComponent::showAnalystMenu()
+{
+    juce::PopupMenu menu;
+    menu.addItem(1, "Analizar grabación...");
+    menu.addItem(2, "Vista previa de recomendaciones", analystSourceFile.existsAsFile());
+    menu.addItem(3, "Aplicar recomendaciones confirmadas", analystRecommendations.isArray());
+    menu.addItem(8, "Comparar con referencia...", analystSourceFile.existsAsFile());
+    menu.addItem(9, "Transcribir prédica (Whisper)", analystSourceFile.existsAsFile());
+    menu.addItem(10, "Separar voz/música (Demucs)", analystSourceFile.existsAsFile());
+    menu.addSeparator();
+    menu.addItem(4, "Marcar: Sonó excelente", analystSourceFile.existsAsFile());
+    menu.addItem(5, "Marcar: Aceptable", analystSourceFile.existsAsFile());
+    menu.addItem(6, "Marcar: No me gustó", analystSourceFile.existsAsFile());
+    menu.addSeparator();
+    menu.addItem(7, "Borrar historial aprendido...");
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(analystButton), [this](int selection)
+    {
+        if (selection == 1) chooseAnalystRecording();
+        else if (selection == 2 && analystSourceFile.existsAsFile())
+        {
+            auto body = juce::var(new juce::DynamicObject());
+            body.getDynamicObject()->setProperty("path", analystSourceFile.getFullPathName());
+            body.getDynamicObject()->setProperty("church", churchNameEditor.getText().trim());
+            messageLabel.setText("Church Sound Analyst: preparando vista previa...", juce::dontSendNotification);
+            analystClient.request("/recommendations/preview", std::move(body), [this](bool ok, juce::String response)
+            {
+                const auto parsed = juce::JSON::parse(response);
+                if (ok && parsed.isObject())
+                {
+                    analystRecommendations = parsed.getDynamicObject()->getProperty("recommendations");
+                    messageLabel.setText("Vista previa lista. Revísala y selecciona Aplicar para confirmar.", juce::dontSendNotification);
+                }
+                else showResult(response, {});
+            });
+        }
+        else if (selection == 3) applyAnalystRecommendations();
+        else if (selection == 8 && analystSourceFile.existsAsFile())
+        {
+            analystReferenceChooser = std::make_unique<juce::FileChooser>("Select reference recording", juce::File(), "*.wav;*.flac;*.aif;*.aiff");
+            analystReferenceChooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                                                  [this](const juce::FileChooser& chooser)
+            {
+                const auto reference = chooser.getResult();
+                if (!reference.existsAsFile()) return;
+                auto body = juce::var(new juce::DynamicObject());
+                body.getDynamicObject()->setProperty("source_path", analystSourceFile.getFullPathName());
+                body.getDynamicObject()->setProperty("reference_path", reference.getFullPathName());
+                analystClient.request("/reference-match", std::move(body), [this](bool ok, juce::String response)
+                {
+                    if (!ok) { showResult(response, {}); return; }
+                    const auto parsed = juce::JSON::parse(response);
+                    const auto delta = parsed.getDynamicObject() != nullptr ? parsed.getDynamicObject()->getProperty("loudness_delta_lufs").toString() : "?";
+                    messageLabel.setText("Reference Match listo: diferencia de loudness " + delta + " LUFS (curva limitada a ±3 dB).", juce::dontSendNotification);
+                });
+            });
+        }
+        else if (selection == 9 && analystSourceFile.existsAsFile())
+        {
+            auto body = juce::var(new juce::DynamicObject());
+            body.getDynamicObject()->setProperty("path", analystSourceFile.getFullPathName());
+            body.getDynamicObject()->setProperty("model", "small");
+            messageLabel.setText("Whisper está transcribiendo fuera de línea...", juce::dontSendNotification);
+            analystClient.request("/transcribe", std::move(body), [this](bool ok, juce::String response)
+            {
+                if (!ok) { showResult(response, {}); return; }
+                const auto parsed = juce::JSON::parse(response);
+                const auto text = parsed.getDynamicObject() != nullptr ? parsed.getDynamicObject()->getProperty("text").toString().substring(0, 100) : "";
+                messageLabel.setText("Transcripción lista: " + text, juce::dontSendNotification);
+            });
+        }
+        else if (selection == 10 && analystSourceFile.existsAsFile())
+        {
+            auto body = juce::var(new juce::DynamicObject());
+            body.getDynamicObject()->setProperty("path", analystSourceFile.getFullPathName());
+            body.getDynamicObject()->setProperty("output_dir", AppSettings::getDataDirectory().getChildFile("Church Sound Analyst Stems").getFullPathName());
+            body.getDynamicObject()->setProperty("two_stems", true);
+            messageLabel.setText("Demucs está separando fuentes fuera de línea...", juce::dontSendNotification);
+            analystClient.request("/separate", std::move(body), [this](bool ok, juce::String response)
+            {
+                showResult(ok ? juce::String() : response, ok ? "Separación terminada; los stems están guardados localmente" : juce::String());
+            });
+        }
+        else if (selection == 4) sendAnalystFeedback("excellent");
+        else if (selection == 5) sendAnalystFeedback("acceptable");
+        else if (selection == 6) sendAnalystFeedback("disliked");
+        else if (selection == 7)
+        {
+            juce::AlertWindow::showOkCancelBox(juce::MessageBoxIconType::WarningIcon, "Borrar historial local",
+                                                "Se borrarán sólo métricas y calificaciones aprendidas, nunca audio.", "BORRAR", "CANCELAR", this,
+                                                juce::ModalCallbackFunction::create([this](int result)
+            {
+                if (result != 1) return;
+                analystClient.request("/learning/reset", juce::var(new juce::DynamicObject()), [this](bool ok, juce::String response)
+                {
+                    showResult(ok ? juce::String() : response, ok ? "Historial aprendido borrado" : juce::String());
+                });
+            }));
+        }
+    });
+}
+
+void MainComponent::chooseAnalystRecording()
+{
+    analystFileChooser = std::make_unique<juce::FileChooser>("Select recording for Church Sound Analyst", juce::File(), "*.wav;*.flac;*.aif;*.aiff");
+    analystFileChooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                                    [this](const juce::FileChooser& chooser)
+    {
+        const auto file = chooser.getResult();
+        if (!file.existsAsFile()) return;
+        analystSourceFile = file;
+        analystRecommendations = juce::var();
+        messageLabel.setText("Church Sound Analyst: analizando fuera de línea...", juce::dontSendNotification);
+        analystClient.analyzeFile(file, [this](bool ok, juce::String response)
+        {
+            const auto parsed = juce::JSON::parse(response);
+            if (!ok || !parsed.isObject()) { showResult(response, {}); return; }
+            auto* root = parsed.getDynamicObject();
+            analystRecommendations = root->getProperty("recommendations");
+            const auto lufs = root->getProperty("lufs_integrated").toString();
+            const auto peak = root->getProperty("true_peak_dbtp").toString();
+            messageLabel.setText("Reporte listo: " + lufs + " LUFS, " + peak + " dBTP. Abre ANALYZE PYTHON para vista previa.",
+                                 juce::dontSendNotification);
+        });
+    });
+}
+
+void MainComponent::applyAnalystRecommendations()
+{
+    if (!analystRecommendations.isArray()) return;
+    juce::AlertWindow::showOkCancelBox(juce::MessageBoxIconType::QuestionIcon, "Aplicar recomendaciones",
+                                        "Se aplicarán sólo ajustes conservadores (máximo 3 dB). El audio en vivo seguirá en C++.",
+                                        "APLICAR", "CANCELAR", this, juce::ModalCallbackFunction::create([this](int result)
+    {
+        if (result != 1) return;
+        auto& parameters = audioEngine.getProcessingEngine().getParameters();
+        for (const auto& item : *analystRecommendations.getArray())
+        {
+            auto* object = item.getDynamicObject();
+            if (object == nullptr) continue;
+            const auto kind = object->getProperty("kind").toString();
+            const auto rawGain = static_cast<float>(static_cast<double>(object->getProperty("gain_db")));
+            const auto gain = juce::jlimit(-3.0f, 3.0f, rawGain);
+            if (kind == "dynamic_eq_mud") parameters.analystMudOffsetDb.store(gain, std::memory_order_release);
+            else if (kind == "dynamic_eq_harshness") parameters.analystHarshOffsetDb.store(gain, std::memory_order_release);
+            else if (kind == "de_esser") parameters.analystSibilanceOffsetDb.store(gain, std::memory_order_release);
+            else if (kind == "loudness_target") parameters.loudnessTarget.store(juce::jlimit(-18.0f, -10.0f, rawGain), std::memory_order_release);
+        }
+        auto body = juce::var(new juce::DynamicObject());
+        body.getDynamicObject()->setProperty("confirm", true);
+        body.getDynamicObject()->setProperty("church", churchNameEditor.getText().trim());
+        body.getDynamicObject()->setProperty("recommendations", analystRecommendations);
+        analystClient.request("/recommendations/apply", std::move(body), [this](bool ok, juce::String response)
+        {
+            showResult(ok ? juce::String() : response, ok ? "Recomendaciones conservadoras aplicadas" : juce::String());
+        });
+    }));
+}
+
+void MainComponent::sendAnalystFeedback(const juce::String& rating)
+{
+    auto body = juce::var(new juce::DynamicObject());
+    body.getDynamicObject()->setProperty("church", churchNameEditor.getText().trim());
+    body.getDynamicObject()->setProperty("rating", rating);
+    body.getDynamicObject()->setProperty("metrics", juce::var(new juce::DynamicObject()));
+    body.getDynamicObject()->setProperty("accepted", analystRecommendations.isArray() ? analystRecommendations : juce::var(juce::Array<juce::var>()));
+    analystClient.request("/feedback", std::move(body), [this](bool ok, juce::String response)
+    {
+        showResult(ok ? juce::String() : response, ok ? "Calificación guardada localmente" : juce::String());
+    });
 }
 
 void MainComponent::refreshUserPresets()
