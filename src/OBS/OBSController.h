@@ -32,6 +32,7 @@ public:
     void pollInstallationAndProcess();
     bool openOBS();
     void reconnect();
+    void reapplyAudioSource();
     void setPassword(const juce::String& password);
     [[nodiscard]] OBSState getState() const;
 

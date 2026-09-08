@@ -6,16 +6,16 @@ namespace churchstream
 {
 namespace Colours
 {
-inline const juce::Colour background { 0xff0a0d12 };
-inline const juce::Colour card { 0xff121821 };
-inline const juce::Colour cardBorder { 0xff232c39 };
-inline const juce::Colour primary { 0xff5ce1a5 };
-inline const juce::Colour cyan { 0xff50c9ff };
-inline const juce::Colour warning { 0xffffc857 };
-inline const juce::Colour danger { 0xffff5c70 };
-inline const juce::Colour text { 0xfff4f7fa };
-inline const juce::Colour mutedText { 0xff8e9aaa };
-inline const juce::Colour control { 0xff1a222d };
+inline const juce::Colour background { 0xff0f1117 };
+inline const juce::Colour card { 0xff1a1d27 };
+inline const juce::Colour cardBorder { 0xff2d3348 };
+inline const juce::Colour primary { 0xff6366f1 };
+inline const juce::Colour cyan { 0xff818cf8 };
+inline const juce::Colour warning { 0xfffbbf24 };
+inline const juce::Colour danger { 0xfff43f5e };
+inline const juce::Colour text { 0xffe2e8f0 };
+inline const juce::Colour mutedText { 0xff64748b };
+inline const juce::Colour control { 0xff242938 };
 } // namespace Colours
 
 class Theme final : public juce::LookAndFeel_V4

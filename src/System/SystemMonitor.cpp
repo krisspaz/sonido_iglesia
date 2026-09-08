@@ -111,7 +111,7 @@ double SystemMonitor::sampleProcessCpuPercent()
     const auto wallDelta = wallTimeNanoseconds - previousProcessWallTime;
     previousProcessTime = processTimeNanoseconds;
     previousProcessWallTime = wallTimeNanoseconds;
-    const auto processors = static_cast<double>(std::max(1, juce::SystemStats::getNumCpus()));
+    const auto processors = static_cast<double>((std::max)(1, juce::SystemStats::getNumCpus()));
     return std::clamp(100.0 * processDelta / wallDelta / processors, 0.0, 100.0);
 }
 

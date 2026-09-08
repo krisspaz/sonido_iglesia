@@ -367,7 +367,11 @@ bool AudioEngine::looksLikeVirtualOutput(const juce::String& name)
 {
     const auto lower = name.toLowerCase();
     return lower.contains("church stream processor output")
-        || lower.contains("church stream virtual");
+        || lower.contains("church stream virtual")
+        || lower.contains("cable input")
+        || lower.contains("vb-audio")
+        || lower.contains("vb audio")
+        || lower.contains("voicemeeter");
 }
 
 void AudioEngine::rememberCurrentSetup()
@@ -379,6 +383,8 @@ void AudioEngine::rememberCurrentSetup()
 
 juce::String AudioEngine::applySetup(const juce::AudioDeviceManager::AudioDeviceSetup& setup)
 {
+    juce::Logger::writeToLog("applySetup: input=[" + setup.inputDeviceName
+        + "] output=[" + setup.outputDeviceName + "]");
     const auto error = deviceManager.setAudioDeviceSetup(setup, true);
     {
         const juce::ScopedLock lock(errorLock);
@@ -387,6 +393,8 @@ juce::String AudioEngine::applySetup(const juce::AudioDeviceManager::AudioDevice
 
     if (error.isEmpty())
         rememberCurrentSetup();
+    else
+        juce::Logger::writeToLog("applySetup error: " + error);
 
     return error;
 }

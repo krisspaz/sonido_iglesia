@@ -58,6 +58,15 @@ void OBSController::reconnect()
     webSocket.start();
 }
 
+void OBSController::reapplyAudioSource()
+{
+    bool connected = false;
+    { const juce::ScopedLock lock(stateLock); connected = state.obsConnected; }
+    if (!connected) return;
+    if (!requestedScene || !requestedInputs) return;
+    attemptAudioSourceConfiguration();
+}
+
 void OBSController::setPassword(const juce::String& newPassword)
 {
     // Stop the listener before replacing the String that handleHello reads.
@@ -287,14 +296,20 @@ void OBSController::sendRequest(const juce::String& requestType, juce::DynamicOb
 void OBSController::attemptAudioSourceConfiguration()
 {
     if (!requestedScene || !requestedInputs) return;
+    // Prefer the dedicated signed endpoint. On machines where only the
+    // already-installed VB-Audio cable is available, fall back to its capture
+    // endpoint so the processor can feed OBS without changing OBS scenes or
+    // interrupting an active transmission.
     endpointId = WindowsAudioEndpoint::findCaptureEndpointId("Church Stream Processor Output");
+    if (endpointId.isEmpty())
+        endpointId = WindowsAudioEndpoint::findCaptureEndpointId("CABLE Output");
     juce::String scene;
     {
         const juce::ScopedLock lock(stateLock);
         scene = state.currentScene;
         if (endpointId.isEmpty())
         {
-            state.lastError = "Church Stream Processor Output endpoint is not installed";
+            state.lastError = "No audio output endpoint available (install Church Stream Processor driver or VB-Audio Cable)";
             return;
         }
     }

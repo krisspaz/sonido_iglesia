@@ -105,10 +105,30 @@ MainComponent::MainComponent(bool startAudio)
     spectrumTitle.setText("REAL-TIME SPECTRUM", juce::dontSendNotification);
     addAndMakeVisible(spectrumTitle);
     addAndMakeVisible(spectrum);
+    spectrumCollapseButton.setColour(juce::TextButton::buttonColourId, Colours::control);
+    spectrumCollapseButton.setColour(juce::TextButton::textColourOffId, Colours::mutedText);
+    addAndMakeVisible(spectrumCollapseButton);
+    spectrumCollapseButton.onClick = [this]
+    {
+        collapseSpectrum = !collapseSpectrum;
+        spectrumCollapseButton.setButtonText(collapseSpectrum ? "+" : "-");
+        applySectionVisibility();
+        resized();
+    };
 
     configureHeading(smartTitle, 12.0f, Colours::text);
     smartTitle.setText("SMART ENGINE", juce::dontSendNotification);
     addAndMakeVisible(smartTitle);
+    dspCollapseButton.setColour(juce::TextButton::buttonColourId, Colours::control);
+    dspCollapseButton.setColour(juce::TextButton::textColourOffId, Colours::mutedText);
+    addAndMakeVisible(dspCollapseButton);
+    dspCollapseButton.onClick = [this]
+    {
+        collapseDsp = !collapseDsp;
+        dspCollapseButton.setButtonText(collapseDsp ? "+" : "-");
+        applySectionVisibility();
+        resized();
+    };
     smartProcessing.setColour(juce::ToggleButton::textColourId, Colours::text);
     smartProcessing.setColour(juce::ToggleButton::tickColourId, Colours::primary);
     addAndMakeVisible(smartProcessing);
@@ -167,6 +187,16 @@ MainComponent::MainComponent(bool startAudio)
     routingTitle.setText("AUDIO ROUTING", juce::dontSendNotification);
     addAndMakeVisible(routingTitle);
     addAndMakeVisible(x32Panel);
+    routingCollapseButton.setColour(juce::TextButton::buttonColourId, Colours::control);
+    routingCollapseButton.setColour(juce::TextButton::textColourOffId, Colours::mutedText);
+    addAndMakeVisible(routingCollapseButton);
+    routingCollapseButton.onClick = [this]
+    {
+        collapseRouting = !collapseRouting;
+        routingCollapseButton.setButtonText(collapseRouting ? "+" : "-");
+        applySectionVisibility();
+        resized();
+    };
     configureHeading(inputLabel, 9.5f, Colours::mutedText);
     inputLabel.setText("INPUT", juce::dontSendNotification);
     addAndMakeVisible(inputLabel);
@@ -216,6 +246,27 @@ MainComponent::MainComponent(bool startAudio)
     latencyLabel.setJustificationType(juce::Justification::centred);
     diagnosticsLabel.setJustificationType(juce::Justification::centredRight);
     diagnosticsLabel.setVisible(developmentMode.getToggleState());
+
+    // Minimal UI — hide non-essential components
+    phaseLabel.setVisible(false);
+    performanceProfile.setVisible(false);
+    developmentMode.setVisible(false);
+    spectrum.setVisible(false);
+    spectrumTitle.setVisible(false);
+    spectrumCollapseButton.setVisible(false);
+    dspCollapseButton.setVisible(false);
+    routingCollapseButton.setVisible(false);
+    x32Panel.setVisible(false);
+    qualityPanel.setVisible(false);
+    measurementsTitle.setVisible(false);
+    for (auto& l : metricNames) l.setVisible(false);
+    for (auto& l : metricValues) l.setVisible(false);
+    actionsTitle.setVisible(false);
+    actionsLabel.setVisible(false);
+    abButton.setVisible(false);
+    resetDspButton.setVisible(true);
+    latencyLabel.setVisible(false);
+    diagnosticsLabel.setVisible(false);
 
     updateDspControls();
     inputDevice.onChange = [this] { handleInputSelection(); };
@@ -419,7 +470,7 @@ MainComponent::MainComponent(bool startAudio)
     audioEngine.getSmartEngine().setScene(static_cast<SmartScene>(static_cast<int>(settings.getNumber("smartScene", 0.0))));
     applyConsoleAndGroupSettings();
     updateLiveValues();
-    setSize(1180, 980);
+    setSize(1100, 760);
     applyRefreshRate();
 }
 
@@ -447,19 +498,13 @@ void MainComponent::resized()
 {
     auto bounds = getLocalBounds().reduced(20);
     auto header = bounds.removeFromTop(44);
-    titleLabel.setBounds(header.removeFromLeft(345));
-    phaseLabel.setBounds(header.removeFromLeft(145));
-    header.removeFromLeft(10);
-    performanceProfile.setBounds(header.removeFromLeft(110).reduced(0, 4));
-    header.removeFromLeft(6);
-    liveMode.setBounds(header.removeFromLeft(100));
-    header.removeFromLeft(6);
-    developmentMode.setBounds(header.removeFromLeft(112));
-    header.removeFromLeft(6);
-    advancedButton.setBounds(header.removeFromLeft(90).reduced(0, 4));
+    titleLabel.setBounds(header.removeFromLeft(360));
+    advancedButton.setBounds(header.removeFromRight(90).reduced(0, 5));
+    header.removeFromRight(10);
+    liveMode.setBounds(header.removeFromRight(120));
 
     bounds.removeFromTop(8);
-    auto statuses = bounds.removeFromTop(52);
+    auto statuses = bounds.removeFromTop(42);
     const auto badgeWidth = (statuses.getWidth() - 30) / 4;
     for (auto* badge : { &x32Status, &audioStatus, &obsStatus, &streamStatus })
     {
@@ -467,114 +512,98 @@ void MainComponent::resized()
         statuses.removeFromLeft(10);
     }
 
-    bounds.removeFromTop(10);
-    cardBounds[0] = bounds.removeFromTop(122);
-    auto meters = cardBounds[0].reduced(18, 12);
-    const auto meterWidth = (meters.getWidth() - 28) / 2;
-    inputMeter.setBounds(meters.removeFromLeft(meterWidth));
-    meters.removeFromLeft(28);
-    outputMeter.setBounds(meters);
+    bounds.removeFromTop(8);
+    cardBounds[0] = bounds.removeFromTop(90);
+    {
+        auto meters = cardBounds[0].reduced(18, 12);
+        const auto meterWidth = (meters.getWidth() - 28) / 2;
+        inputMeter.setBounds(meters.removeFromLeft(meterWidth));
+        meters.removeFromLeft(28);
+        outputMeter.setBounds(meters);
+    }
 
     bounds.removeFromTop(10);
-    cardBounds[1] = bounds.removeFromTop(148);
-    auto spectrumArea = cardBounds[1].reduced(18, 10);
-    spectrumTitle.setBounds(spectrumArea.removeFromTop(18));
-    spectrum.setBounds(spectrumArea);
-
-    bounds.removeFromTop(10);
-    auto central = bounds.removeFromTop(std::max(300, bounds.getHeight() - 120));
-    cardBounds[2] = central.removeFromLeft(static_cast<int>(static_cast<float>(central.getWidth()) * 0.57f));
+    auto central = bounds;
+    cardBounds[1] = central.removeFromLeft(static_cast<int>(central.getWidth() * 0.54f));
     central.removeFromLeft(10);
-    cardBounds[3] = central;
+    cardBounds[2] = central;
+    cardBounds[3] = {};
+    cardBounds[4] = {};
 
-    auto smart = cardBounds[2].reduced(18, 12);
-    auto smartHeader = smart.removeFromTop(35);
-    smartTitle.setBounds(smartHeader.removeFromLeft(115));
-    smartProcessing.setBounds(smartHeader.removeFromLeft(155));
-    smartHeader.removeFromLeft(8);
-    operatingMode.setBounds(smartHeader.removeFromLeft(105));
-    smartHeader.removeFromLeft(8);
-    savePresetButton.setBounds(smartHeader.removeFromRight(62));
-    smartHeader.removeFromRight(6);
-    presetSelector.setBounds(smartHeader);
-    smart.removeFromTop(4);
-    std::array<juce::Slider*, 6> sliders { &cleanSlider, &punchSlider, &claritySlider, &dynamicsSlider, &warmthSlider, &loudnessSlider };
-    for (size_t index = 0; index < sliders.size(); ++index)
     {
-        auto row = smart.removeFromTop(34);
-        controlLabels[index].setBounds(row.removeFromLeft(118));
-        sliders[index]->setBounds(row);
-    }
-    smart.removeFromTop(5);
-    auto buttons = smart.removeFromTop(38);
-    const auto buttonWidth = (buttons.getWidth() - 24) / 4;
-    autoTuneButton.setBounds(buttons.removeFromLeft(buttonWidth));
-    buttons.removeFromLeft(8);
-    abButton.setBounds(buttons.removeFromLeft(buttonWidth));
-    buttons.removeFromLeft(8);
-    bypassButton.setBounds(buttons.removeFromLeft(buttonWidth));
-    buttons.removeFromLeft(8);
-    resetDspButton.setBounds(buttons);
+        auto smart = cardBounds[1].reduced(18, 14);
+        auto smartHeader = smart.removeFromTop(38);
+        smartTitle.setBounds(smartHeader.removeFromLeft(130));
+        smartProcessing.setBounds(smartHeader.removeFromLeft(160));
+        smartHeader.removeFromLeft(8);
+        operatingMode.setBounds(smartHeader.removeFromLeft(100));
+        smartHeader.removeFromLeft(8);
+        savePresetButton.setBounds(smartHeader.removeFromRight(58));
+        smartHeader.removeFromRight(6);
+        presetSelector.setBounds(smartHeader);
+        smart.removeFromTop(8);
+        std::array<juce::Slider*, 6> sliders { &cleanSlider, &punchSlider, &claritySlider,
+                                               &dynamicsSlider, &warmthSlider, &loudnessSlider };
+        for (size_t i = 0; i < sliders.size(); ++i)
+        {
+            auto row = smart.removeFromTop(34);
+            controlLabels[i].setBounds(row.removeFromLeft(118));
+            sliders[i]->setBounds(row);
+        }
 
-    auto measurements = cardBounds[3].reduced(18, 12);
-    measurementsTitle.setBounds(measurements.removeFromTop(24));
-    qualityPanel.setBounds(measurements.removeFromTop(178));
-    measurements.removeFromTop(6);
-    auto metricArea = measurements.removeFromTop(104);
-    auto metrics = metricArea.removeFromTop(52);
-    const auto metricWidth = metrics.getWidth() / 4;
-    for (size_t index = 0; index < metricNames.size(); ++index)
+        smart.removeFromTop(12);
+        auto buttons = smart.removeFromTop(40);
+        const auto bw = (buttons.getWidth() - 24) / 4;
+        autoTuneButton.setBounds(buttons.removeFromLeft(bw));
+        buttons.removeFromLeft(8);
+        abButton.setBounds(buttons.removeFromLeft(bw));
+        buttons.removeFromLeft(8);
+        bypassButton.setBounds(buttons.removeFromLeft(bw));
+        buttons.removeFromLeft(8);
+        resetDspButton.setBounds(buttons);
+    }
+
     {
-        if (index == 4) metrics = metricArea;
-        auto metric = metrics.removeFromLeft(metricWidth);
-        metricNames[index].setBounds(metric.removeFromTop(18));
-        metricValues[index].setBounds(metric);
+        auto routing = cardBounds[2].reduced(18, 14);
+        auto routingHeader = routing.removeFromTop(24);
+        routingTitle.setBounds(routingHeader.removeFromLeft(140));
+        analystButton.setBounds(routingHeader.removeFromRight(145).reduced(0, 1));
+        formatLabel.setBounds(routingHeader);
+
+        auto message = routing.removeFromBottom(30);
+        messageLabel.setBounds(message);
+
+        routing.removeFromTop(8);
+        auto inputRow = routing.removeFromTop(44);
+        inputLabel.setBounds(inputRow.removeFromLeft(56));
+        inputDevice.setBounds(inputRow);
+
+        routing.removeFromTop(6);
+        auto outputRow = routing.removeFromTop(44);
+        outputLabel.setBounds(outputRow.removeFromLeft(56));
+        outputDevice.setBounds(outputRow);
+
+        routing.removeFromTop(12);
+        auto actionRow = routing.removeFromTop(40);
+        const auto abw = (actionRow.getWidth() - 16) / 3;
+        autoConfigureButton.setBounds(actionRow.removeFromLeft(abw));
+        actionRow.removeFromLeft(8);
+        openObsButton.setBounds(actionRow.removeFromLeft(abw));
+        actionRow.removeFromLeft(8);
+        offlineTestButton.setBounds(actionRow);
+
+        routing.removeFromTop(8);
+        auto obsRow = routing.removeFromTop(40);
+        obsPasswordEditor.setBounds(obsRow.removeFromLeft(static_cast<int>(obsRow.getWidth() * 0.62f)).reduced(0, 3));
+        obsRow.removeFromLeft(8);
+        connectObsButton.setBounds(obsRow.reduced(0, 3));
+
+        routing.removeFromTop(12);
+        startWithWindows.setBounds(routing.removeFromTop(26));
+        startMinimized.setBounds(routing.removeFromTop(26));
+        routing.removeFromTop(6);
+        churchNameEditor.setBounds(routing.removeFromTop(36).reduced(0, 3));
     }
-    measurements.removeFromTop(4);
-    actionsTitle.setBounds(measurements.removeFromTop(22));
-    actionsLabel.setBounds(measurements);
-
-    bounds.removeFromTop(10);
-    cardBounds[4] = bounds;
-    auto routing = cardBounds[4].reduced(18, 10);
-    auto routingHeader = routing.removeFromTop(22);
-    routingTitle.setBounds(routingHeader.removeFromLeft(150));
-    analystButton.setBounds(routingHeader.removeFromRight(145).reduced(0, 1));
-    formatLabel.setBounds(routingHeader.removeFromLeft(220));
-    latencyLabel.setBounds(routingHeader.removeFromLeft(160));
-    diagnosticsLabel.setBounds(routingHeader);
-    auto message = routing.removeFromBottom(26);
-    messageLabel.setBounds(message);
-
-    // Four bounded columns keep every routing/OBS/X32 control usable at the
-    // minimum 1080 px window width and at common Windows DPI scales.
-    auto x32Block = routing.removeFromRight(240);
-    routing.removeFromRight(10);
-    auto toggles = routing.removeFromRight(180);
-    routing.removeFromRight(8);
-    auto actions = routing.removeFromRight(390);
-    routing.removeFromRight(12);
-    x32Panel.setBounds(x32Block);
-    startWithWindows.setBounds(toggles.removeFromTop(28));
-    startMinimized.setBounds(toggles.removeFromTop(28));
-    churchNameEditor.setBounds(toggles.removeFromTop(34).reduced(0, 3));
-    auto inputRow = routing.removeFromTop(42);
-    inputLabel.setBounds(inputRow.removeFromLeft(58));
-    inputDevice.setBounds(inputRow);
-    auto outputRow = routing.removeFromTop(42);
-    outputLabel.setBounds(outputRow.removeFromLeft(58));
-    outputDevice.setBounds(outputRow);
-
-    auto actionRow = actions.removeFromTop(42);
-    autoConfigureButton.setBounds(actionRow.removeFromLeft(145));
-    actionRow.removeFromLeft(8);
-    openObsButton.setBounds(actionRow.removeFromLeft(105));
-    actionRow.removeFromLeft(8);
-    offlineTestButton.setBounds(actionRow);
-    auto obsRow = actions.removeFromTop(42);
-    obsPasswordEditor.setBounds(obsRow.removeFromLeft(215).reduced(0, 4));
-    obsRow.removeFromLeft(8);
-    connectObsButton.setBounds(obsRow.reduced(0, 3));
 }
 
 void MainComponent::setBypassed(bool shouldBypass)
@@ -723,6 +752,7 @@ void MainComponent::handleInputSelection()
     const auto index = inputDevice.getSelectedItemIndex();
     if (!juce::isPositiveAndBelow(index, inputDeviceNames.size())) return;
     const auto error = audioEngine.selectInput(inputDeviceNames[index]);
+    refreshDeviceLists();
     showResult(error, "Input connected");
 }
 
@@ -738,6 +768,7 @@ void MainComponent::handleOutputSelection()
     const auto index = outputDevice.getSelectedItemIndex();
     if (!juce::isPositiveAndBelow(index, outputDeviceNames.size())) return;
     const auto error = audioEngine.selectOutput(outputDeviceNames[index]);
+    refreshDeviceLists();
     showResult(error, "Output connected");
 }
 
@@ -752,6 +783,8 @@ void MainComponent::runAutoConfigure()
                                                    : audioEngine.initialise();
     refreshDeviceLists();
     showResult(error, "X32 route configured");
+    if (error.isEmpty() && obsController.getState().obsConnected)
+        obsController.reconnect();
 }
 
 bool MainComponent::liveRoutingLocked() const
@@ -907,9 +940,22 @@ void MainComponent::updateLiveValues()
     else autoTuneButton.setButtonText("AUTO TUNE");
 
     const auto sampleRate = audioEngine.getSampleRate();
-    formatLabel.setText(sampleRate > 0.0 ? juce::String(sampleRate / 1000.0, 1) + " kHz | "
-                                              + juce::String(audioEngine.getBufferSize()) + " samples"
-                                        : "No active format", juce::dontSendNotification);
+    if (sampleRate > 0.0)
+    {
+        const auto inShort = audioEngine.getCurrentInputName().upToFirstOccurrenceOf("(", false, false).trim();
+        const auto outShort = audioEngine.getCurrentOutputName().upToFirstOccurrenceOf("(", false, false).trim();
+        formatLabel.setText(inShort + " -> " + outShort + "  " + juce::String(sampleRate / 1000.0, 1) + " kHz",
+                            juce::dontSendNotification);
+        formatLabel.setTooltip("IN: " + audioEngine.getCurrentInputName()
+            + "\nOUT: " + audioEngine.getCurrentOutputName()
+            + "\n" + juce::String(audioEngine.getBufferSize()) + " samples"
+            + "  Latency " + juce::String(audioEngine.getLatencyMilliseconds(), 1) + " ms");
+    }
+    else
+    {
+        formatLabel.setText("No active format", juce::dontSendNotification);
+        formatLabel.setTooltip({});
+    }
     latencyLabel.setText("Latency " + juce::String(audioEngine.getLatencyMilliseconds(), 1) + " ms", juce::dontSendNotification);
     if (developmentMode.getToggleState())
         diagnosticsLabel.setText("APP " + juce::String(processCpuPercent, 2) + "% | SYSTEM "
@@ -1176,5 +1222,52 @@ void MainComponent::configureMetricLabel(juce::Label& label)
 juce::String MainComponent::formatMetric(float value, int decimals, const juce::String& suffix)
 {
     return std::isfinite(value) && value > -99.0f ? juce::String(value, decimals) + suffix : "--";
+}
+
+void MainComponent::applySectionVisibility()
+{
+    // The compact dashboard intentionally has no spectrum/measurement cards.
+    spectrum.setVisible(false);
+    spectrumTitle.setVisible(false);
+    qualityPanel.setVisible(false);
+    measurementsTitle.setVisible(false);
+    x32Panel.setVisible(false);
+
+    const bool dsp = !collapseDsp;
+    smartProcessing.setVisible(dsp);
+    operatingMode.setVisible(dsp);
+    presetSelector.setVisible(dsp);
+    savePresetButton.setVisible(dsp);
+    for (auto& label : controlLabels) label.setVisible(dsp);
+    cleanSlider.setVisible(dsp);
+    punchSlider.setVisible(dsp);
+    claritySlider.setVisible(dsp);
+    dynamicsSlider.setVisible(dsp);
+    warmthSlider.setVisible(dsp);
+    loudnessSlider.setVisible(dsp);
+    autoTuneButton.setVisible(dsp);
+    abButton.setVisible(dsp);
+    bypassButton.setVisible(dsp);
+    resetDspButton.setVisible(dsp);
+    for (auto& label : metricNames) label.setVisible(false);
+    for (auto& label : metricValues) label.setVisible(false);
+    actionsTitle.setVisible(false);
+    actionsLabel.setVisible(false);
+
+    const bool routing = !collapseRouting;
+    inputLabel.setVisible(routing);
+    outputLabel.setVisible(routing);
+    inputDevice.setVisible(routing);
+    outputDevice.setVisible(routing);
+    autoConfigureButton.setVisible(routing);
+    openObsButton.setVisible(routing);
+    offlineTestButton.setVisible(routing);
+    analystButton.setVisible(routing);
+    obsPasswordEditor.setVisible(routing);
+    connectObsButton.setVisible(routing);
+    startWithWindows.setVisible(routing);
+    startMinimized.setVisible(routing);
+    churchNameEditor.setVisible(routing);
+    messageLabel.setVisible(routing);
 }
 } // namespace churchstream

@@ -65,6 +65,7 @@ private:
     void chooseRoomMeasurement();
     void applyBuiltInPreset(int presetIndex);
     void refreshUserPresets();
+    void applySectionVisibility();
     [[nodiscard]] bool liveRoutingLocked() const;
     [[nodiscard]] int getVisibleRefreshRate() const;
     [[nodiscard]] int getSmartUpdateRate() const;
@@ -90,6 +91,9 @@ private:
     juce::ToggleButton liveMode { "LIVE MODE" };
     juce::ToggleButton developmentMode { "DEVELOPMENT" };
     juce::TextButton advancedButton { "ADVANCED" };
+    juce::TextButton spectrumCollapseButton { "-" };
+    juce::TextButton dspCollapseButton { "-" };
+    juce::TextButton routingCollapseButton { "-" };
     StatusBadge x32Status { "X32" };
     StatusBadge audioStatus { "AUDIO" };
     StatusBadge obsStatus { "OBS" };
@@ -154,6 +158,9 @@ private:
     juce::StringArray inputDeviceNames;
     juce::StringArray outputDeviceNames;
     ChurchSoundAnalystClient analystClient;
+    bool collapseSpectrum = false;
+    bool collapseDsp = false;
+    bool collapseRouting = false;
     bool suppressSelectionCallbacks = false;
     bool suppressDspCallbacks = false;
     bool deviceListsDirty = false;

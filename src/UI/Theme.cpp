@@ -16,7 +16,7 @@ Theme::Theme()
     setColour(juce::PopupMenu::highlightedBackgroundColourId, Colours::primary.withAlpha(0.18f));
     setColour(juce::PopupMenu::highlightedTextColourId, Colours::text);
     setColour(juce::TextButton::buttonColourId, Colours::primary);
-    setColour(juce::TextButton::textColourOffId, Colours::background);
+    setColour(juce::TextButton::textColourOffId, Colours::text);
     setColour(juce::TooltipWindow::backgroundColourId, Colours::card);
     setColour(juce::TooltipWindow::textColourId, Colours::text);
     setColour(juce::TooltipWindow::outlineColourId, Colours::cardBorder);
