@@ -1,0 +1,24 @@
+name: Windows x64 Release
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure, build and test native x64 Release
+        shell: pwsh
+        run: .\scripts\build-windows.ps1 -AllowMissingSignedDriver
+      - name: Accelerated one-hour DSP soak
+        shell: pwsh
+        run: .\scripts\run-soak.ps1 -SimulatedSeconds 3600
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ChurchStreamProcessor-Windows-x64-development
+          path: dist/app/*
+          if-no-files-found: error

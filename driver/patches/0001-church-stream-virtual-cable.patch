@@ -1,0 +1,335 @@
+diff --git a/audio/sysvad/sysvad.h b/audio/sysvad/sysvad.h
+--- a/audio/sysvad/sysvad.h
++++ b/audio/sysvad/sysvad.h
+@@ -31,9 +31,9 @@ Abstract:
+ #define SYSVAD_REVISION              0
+ 
+ // Product Id
+-// {5B722BF8-F0AB-47ee-B9C8-8D61D31375A1}
++// {E5EC3A5F-2B5B-432C-81A2-6CF253B6F367}
+ #define STATIC_PID_SYSVAD\
+-    0x5b722bf8, 0xf0ab, 0x47ee, 0xb9, 0xc8, 0x8d, 0x61, 0xd3, 0x13, 0x75, 0xa1
+-DEFINE_GUIDSTRUCT("5B722BF8-F0AB-47ee-B9C8-8D61D31375A1", PID_SYSVAD);
++    0xe5ec3a5f, 0x2b5b, 0x432c, 0x81, 0xa2, 0x6c, 0xf2, 0x53, 0xb6, 0xf3, 0x67
++DEFINE_GUIDSTRUCT("E5EC3A5F-2B5B-432C-81A2-6CF253B6F367", PID_SYSVAD);
+ #define PID_SYSVAD DEFINE_GUIDNAMED(PID_SYSVAD)
+ 
+ // Pool tag used for SYSVAD allocations
+diff --git a/audio/sysvad/common.h b/audio/sysvad/common.h
+--- a/audio/sysvad/common.h
++++ b/audio/sysvad/common.h
+@@ -450,6 +450,20 @@ DECLARE_INTERFACE_(IAdapterCommon, IUnknown)
+         _In_  PDEVICE_OBJECT      DeviceObject 
+     ) PURE;
+ 
++    STDMETHOD_(VOID, VirtualCableWrite)
++    (
++        THIS_
++        _In_reads_bytes_(ByteCount) const BYTE *Data,
++        _In_ ULONG ByteCount
++    ) PURE;
++
++    STDMETHOD_(VOID, VirtualCableRead)
++    (
++        THIS_
++        _Out_writes_bytes_(ByteCount) BYTE *Data,
++        _In_ ULONG ByteCount
++    ) PURE;
++
+     STDMETHOD_(PDEVICE_OBJECT,  GetDeviceObject)
+     (
+         THIS
+diff --git a/audio/sysvad/common.cpp b/audio/sysvad/common.cpp
+--- a/audio/sysvad/common.cpp
++++ b/audio/sysvad/common.cpp
+@@ -88,6 +88,13 @@ class CAdapterCommon : 
+ 
+         DWORD                   m_dwIdleRequests;
+ 
++        static const ULONG      VirtualCableCapacityBytes = 192000;
++        BYTE                    m_VirtualCableBuffer[VirtualCableCapacityBytes];
++        KSPIN_LOCK              m_VirtualCableLock;
++        ULONGLONG               m_VirtualCableReadPosition;
++        ULONGLONG               m_VirtualCableWritePosition;
++        ULONGLONG               m_VirtualCableDroppedBytes;
++
+ #ifdef SYSVAD_USB_SIDEBAND
+         typedef struct _SysvadPowerRelationsDo
+         {
+@@ -117,6 +124,18 @@ class CAdapterCommon : 
+             _In_  PDEVICE_OBJECT  DeviceObject
+         );
+ 
++        STDMETHODIMP_(VOID) VirtualCableWrite
++        (
++            _In_reads_bytes_(ByteCount) const BYTE *Data,
++            _In_ ULONG ByteCount
++        );
++
++        STDMETHODIMP_(VOID) VirtualCableRead
++        (
++            _Out_writes_bytes_(ByteCount) BYTE *Data,
++            _In_ ULONG ByteCount
++        );
++
+         STDMETHODIMP_(PDEVICE_OBJECT)   GetDeviceObject(void);
+         
+         STDMETHODIMP_(PDEVICE_OBJECT)   GetPhysicalDeviceObject(void);
+@@ -773,5 +792,11 @@ CAdapterCommon::Init
+     NTSTATUS        ntStatus    = STATUS_SUCCESS;
+ 
++    KeInitializeSpinLock(&m_VirtualCableLock);
++    m_VirtualCableReadPosition = 0;
++    m_VirtualCableWritePosition = 0;
++    m_VirtualCableDroppedBytes = 0;
++    RtlZeroMemory(m_VirtualCableBuffer, sizeof(m_VirtualCableBuffer));
++
+ #ifdef SYSVAD_BTH_BYPASS
+     m_BthHfpEnableCleanup = FALSE;
+ #endif // SYSVAD_BTH_BYPASS
+@@ -841,6 +866,90 @@ Done:
+     return ntStatus;
+ } // Init
+ 
++//=============================================================================
++#pragma code_seg()
++STDMETHODIMP_(VOID)
++CAdapterCommon::VirtualCableWrite
++(
++    _In_reads_bytes_(ByteCount) const BYTE *Data,
++    _In_ ULONG ByteCount
++)
++{
++    if (Data == NULL || ByteCount == 0)
++    {
++        return;
++    }
++
++    if (ByteCount > VirtualCableCapacityBytes)
++    {
++        Data += ByteCount - VirtualCableCapacityBytes;
++        ByteCount = VirtualCableCapacityBytes;
++    }
++
++    KIRQL oldIrql;
++    KeAcquireSpinLock(&m_VirtualCableLock, &oldIrql);
++
++    const ULONGLONG available = m_VirtualCableWritePosition - m_VirtualCableReadPosition;
++    if (available + ByteCount > VirtualCableCapacityBytes)
++    {
++        const ULONGLONG bytesToDrop = available + ByteCount - VirtualCableCapacityBytes;
++        m_VirtualCableReadPosition += bytesToDrop;
++        m_VirtualCableDroppedBytes += bytesToDrop;
++    }
++
++    const ULONG offset = static_cast<ULONG>(m_VirtualCableWritePosition % VirtualCableCapacityBytes);
++    const ULONG firstPart = min(ByteCount, VirtualCableCapacityBytes - offset);
++    RtlCopyMemory(m_VirtualCableBuffer + offset, Data, firstPart);
++
++    if (ByteCount > firstPart)
++    {
++        RtlCopyMemory(m_VirtualCableBuffer, Data + firstPart, ByteCount - firstPart);
++    }
++
++    m_VirtualCableWritePosition += ByteCount;
++    KeReleaseSpinLock(&m_VirtualCableLock, oldIrql);
++}
++
++//=============================================================================
++STDMETHODIMP_(VOID)
++CAdapterCommon::VirtualCableRead
++(
++    _Out_writes_bytes_(ByteCount) BYTE *Data,
++    _In_ ULONG ByteCount
++)
++{
++    if (Data == NULL || ByteCount == 0)
++    {
++        return;
++    }
++
++    RtlZeroMemory(Data, ByteCount);
++
++    KIRQL oldIrql;
++    KeAcquireSpinLock(&m_VirtualCableLock, &oldIrql);
++
++    const ULONGLONG available = m_VirtualCableWritePosition - m_VirtualCableReadPosition;
++    const ULONG bytesToRead = static_cast<ULONG>(min(static_cast<ULONGLONG>(ByteCount), available));
++
++    if (bytesToRead > 0)
++    {
++        const ULONG offset = static_cast<ULONG>(m_VirtualCableReadPosition % VirtualCableCapacityBytes);
++        const ULONG firstPart = min(bytesToRead, VirtualCableCapacityBytes - offset);
++        RtlCopyMemory(Data, m_VirtualCableBuffer + offset, firstPart);
++
++        if (bytesToRead > firstPart)
++        {
++            RtlCopyMemory(Data + firstPart, m_VirtualCableBuffer, bytesToRead - firstPart);
++        }
++
++        m_VirtualCableReadPosition += bytesToRead;
++    }
++
++    KeReleaseSpinLock(&m_VirtualCableLock, oldIrql);
++}
++
++#pragma code_seg("PAGE")
++
+ //=============================================================================
+ #pragma code_seg("PAGE")
+ STDMETHODIMP_(void)
+diff --git a/audio/sysvad/EndpointsCommon/minwavertstream.h b/audio/sysvad/EndpointsCommon/minwavertstream.h
+--- a/audio/sysvad/EndpointsCommon/minwavertstream.h
++++ b/audio/sysvad/EndpointsCommon/minwavertstream.h
+@@ -315,6 +315,23 @@ private:
+     // Helper functions.
+     //
+     
++    BOOLEAN IsVirtualCableFormat() const
++    {
++        if (m_pWfExt == NULL
++            || m_pWfExt->Format.nChannels != 2
++            || m_pWfExt->Format.nSamplesPerSec != 48000
++            || m_pWfExt->Format.nBlockAlign != 4
++            || m_pWfExt->Format.wBitsPerSample != 16)
++        {
++            return FALSE;
++        }
++
++        return m_pWfExt->Format.wFormatTag == WAVE_FORMAT_PCM
++            || (m_pWfExt->Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE
++                && m_pWfExt->Format.cbSize >= sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
++                && IsEqualGUIDAligned(m_pWfExt->SubFormat, KSDATAFORMAT_SUBTYPE_PCM));
++    }
++
+ #pragma code_seg()
+     ULONG
+     GetAudioModuleListCount()
+diff --git a/audio/sysvad/EndpointsCommon/minwavertstream.cpp b/audio/sysvad/EndpointsCommon/minwavertstream.cpp
+--- a/audio/sysvad/EndpointsCommon/minwavertstream.cpp
++++ b/audio/sysvad/EndpointsCommon/minwavertstream.cpp
+@@ -1472,8 +1472,6 @@ VOID CMiniportWaveRTStream::UpdatePosition
+-        if (!g_DoNotCreateDataFiles)
+-        {
+-            // Read from buffer and write to a file.
+-            ReadBytes(ByteDisplacement);
+-        }
++        // Forward rendered samples to the capture endpoint. Optional sample
++        // data logging remains controlled inside ReadBytes.
++        ReadBytes(ByteDisplacement);
+     }
+     
+     // Increment the DMA position by the number of bytes displaced since the last
+@@ -1516,7 +1514,17 @@ ByteDisplacement - # of bytes to process.
+     while (ByteDisplacement > 0)
+     {
+         ULONG runWrite = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
+-            m_ToneGenerator.GenerateSine(m_pDmaBuffer + bufferOffset, runWrite);
++        PADAPTERCOMMON adapter = m_pMiniport->GetAdapterCommObj();
++
++        if (IsVirtualCableFormat())
++        {
++            adapter->VirtualCableRead(m_pDmaBuffer + bufferOffset, runWrite);
++        }
++        else
++        {
++            RtlZeroMemory(m_pDmaBuffer + bufferOffset, runWrite);
++        }
++
+         bufferOffset = (bufferOffset + runWrite) % m_ulDmaBufferSize;
+         ByteDisplacement -= runWrite;
+     }
+@@ -1547,7 +1555,14 @@ Arguments:
+     while (ByteDisplacement > 0)
+     {
+         ULONG runWrite = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
+-        m_SaveData.WriteData(m_pDmaBuffer + bufferOffset, runWrite);
++        if (IsVirtualCableFormat())
++        {
++            m_pMiniport->GetAdapterCommObj()->VirtualCableWrite(m_pDmaBuffer + bufferOffset, runWrite);
++        }
++        if (!g_DoNotCreateDataFiles)
++        {
++            m_SaveData.WriteData(m_pDmaBuffer + bufferOffset, runWrite);
++        }
+         bufferOffset = (bufferOffset + runWrite) % m_ulDmaBufferSize;
+         ByteDisplacement -= runWrite;
+     }
+diff --git a/audio/sysvad/TabletAudioSample/minipairs.h b/audio/sysvad/TabletAudioSample/minipairs.h
+--- a/audio/sysvad/TabletAudioSample/minipairs.h
++++ b/audio/sysvad/TabletAudioSample/minipairs.h
+@@ -510,9 +510,6 @@ static
+ PENDPOINT_MINIPAIR  g_RenderEndpoints[] = 
+ {
+     &SpeakerMiniports,
+-    &SpeakerHpMiniports,
+-    &HdmiMiniports,
+-    &SpdifMiniports,
+ };
+ 
+ #define g_cRenderEndpoints  (SIZEOF_ARRAY(g_RenderEndpoints))
+@@ -525,9 +522,6 @@ static
+ PENDPOINT_MINIPAIR  g_CaptureEndpoints[] = 
+ {
+     &MicInMiniports,
+-    &MicArray1Miniports,
+-    &MicArray2Miniports,
+-    &MicArray3Miniports,
+ };
+ 
+ #define g_cCaptureEndpoints (SIZEOF_ARRAY(g_CaptureEndpoints))
+diff --git a/audio/sysvad/TabletAudioSample/micinwavtable.h b/audio/sysvad/TabletAudioSample/micinwavtable.h
+--- a/audio/sysvad/TabletAudioSample/micinwavtable.h
++++ b/audio/sysvad/TabletAudioSample/micinwavtable.h
+@@ -15,7 +15,7 @@ Abstract:
+ //
+ // Mic in (external: headphone) range.
+ //
+-#define MICIN_DEVICE_MAX_CHANNELS           1       // Max Channels.
++#define MICIN_DEVICE_MAX_CHANNELS           2       // Max Channels.
+ #define MICIN_MIN_BITS_PER_SAMPLE_PCM       16      // Min Bits Per Sample
+ #define MICIN_MAX_BITS_PER_SAMPLE_PCM       16      // Max Bits Per Sample
+ #define MICIN_MIN_SAMPLE_RATE               8000    // Min Sample Rate
+@@ -233,15 +233,15 @@ MicInPinSupportedDeviceFormats[] =
+         {
+             {
+                 WAVE_FORMAT_EXTENSIBLE,
+-                1,
++                2,
+                 48000,
+-                96000,
+-                2,
++                192000,
++                4,
+                 16,
+                 sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
+             },
+             16,
+-            KSAUDIO_SPEAKER_MONO,
++            KSAUDIO_SPEAKER_STEREO,
+             STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM)
+         }
+     }
+diff --git a/audio/sysvad/TabletAudioSample/micintoptable.h b/audio/sysvad/TabletAudioSample/micintoptable.h
+--- a/audio/sysvad/TabletAudioSample/micintoptable.h
++++ b/audio/sysvad/TabletAudioSample/micintoptable.h
+@@ -21,8 +21,8 @@ PropertyHandler_MicInTopoFilter( 
+     _In_ PPCPROPERTY_REQUEST      PropertyRequest 
+     );
+
+ //
+-// {d48deb08-fd1c-4d1e-b821-9064d49ae96e}
++// {33999AFE-398E-4451-AC69-25136D0E9F7F}
+ DEFINE_GUID(MICIN_CUSTOM_NAME, 
+-0xd48deb08, 0xfd1c, 0x4d1e, 0xb8, 0x21, 0x90, 0x64, 0xd4, 0x9a, 0xe9, 0x6e);
++0x33999afe, 0x398e, 0x4451, 0xac, 0x69, 0x25, 0x13, 0x6d, 0x0e, 0x9f, 0x7f);
+
+@@ -28,7 +28,7 @@ DEFINE_GUID(MICIN_CUSTOM_NAME, 
+ static
+ KSJACK_DESCRIPTION MicInJackDesc =
+ {
+-    KSAUDIO_SPEAKER_MONO,
++    KSAUDIO_SPEAKER_STEREO,
+     JACKDESC_RGB(179, 201, 140),
+     eConnTypeCombination,
+     eGeoLocRear,
