@@ -40,53 +40,40 @@ constexpr float coherenceMinimumWidth = 0.55f;
 // -14 LUFS, and because the leveler measures after that gain it cancelled it.
 // Both were on by default, so the stream sat several dB under the operator's
 // target with the two loops slowly working against each other.
-constexpr float levelerMaximumBoostDb = 15.0f;
+//
+// The recovery range is the total the leveller may apply, wherever in the chain
+// that gain sits. The sermons of two recorded services sat at -32.7 and -38 LUFS
+// against -17 and -28 for worship; +24 dB brings a -38 LUFS sermon to a -14
+// target. The gate is what keeps that range off room tone: pauses freeze the
+// gain and real silence returns it to unity.
+constexpr float levelerMaximumBoostDb = 24.0f;
 constexpr float levelerMaximumCutDb = -10.0f;
-// Kalman tuning, expressed as the time constant each steady-state gain
-// corresponds to, because seconds are reviewable and covariances are not.
-constexpr double kalmanSteadySeconds = 2.00;
-constexpr double kalmanSectionChangeSeconds = 0.05;
-constexpr double kalmanDetectorSeconds = 0.05;
-constexpr double kalmanInnovationSeconds = 0.50;
-// Measurement noise in dB^2. Programme RMS wanders by a few dB between
-// syllables even when nothing about the mix has changed.
-constexpr float kalmanMeasurementNoise = 9.0f;
-// Innovation this small is ordinary programme variation; this large is a
-// section change. Between them the filter speeds up proportionally.
-constexpr float kalmanInnovationFloorDb = 4.0f;
-constexpr float kalmanInnovationCeilingDb = 12.0f;
-// Gating, in the shape of BS.1770: an absolute floor plus a relative gate
-// below the running programme level. The relative gate does the real work of
-// excluding prayer pauses; the absolute one only catches true silence.
-constexpr double loudnessAverageSeconds = 30.0;
-constexpr float levelerAbsoluteGateDb = -60.0f;
-constexpr float levelerRelativeGateDb = 10.0f;
-// A quieter section settles near the relative gate rather than far below it,
-// and without hysteresis it sits there flickering the gate open and shut. That
-// costs more than a few wasted branches: the hold that decides pause from
-// section restarts on every flicker, so the section is never recognised at all.
-constexpr float levelerGateHysteresisDb = 2.0f;
-// How long silence must last before the leveler stands down, and how quickly
-// it then slides to unity. Nothing is audible while it happens, by definition.
-// Long enough to sit through a pause for prayer, short enough that a genuinely
-// quieter section is picked up while it is still the same thought.
-constexpr double levelerGateHoldSeconds = 2.50;
-// How long the estimate is allowed to move quickly after a section has been
-// accepted. Long enough to cover the step, short enough that the next fall is
-// judged on its own merits.
-constexpr double levelerSectionRebaseSeconds = 3.00;
-constexpr double levelerGateIntegrationSeconds = 0.40;
-constexpr double levelerVariationSeconds = 0.70;
-// Speech modulates its own level by several dB just by being speech. Steady
-// noise sits far below this even before the step that produced it has settled.
-constexpr float levelerSpeechVariationDb = 2.0f;
-constexpr double levelerSilenceReleaseSeconds = 1.50;
-constexpr double levelerSilenceSlideSeconds = 0.60;
-constexpr float kalmanInitialCovariance = 400.0f;
-
+// Programme level the compressor works at. The leveller brings the programme
+// here before the crossover, so the compressor thresholds below are relative to
+// this rather than to whatever the console happens to send. Chosen so the
+// programme peaks sit several dB under full scale even on 20 dB-crest speech,
+// which keeps the saturation stage gentle.
+constexpr float levelerWorkingLevelDb = -20.0f;
+// How the loudness the compressor removes is given back after it. Slow, because
+// it only has to follow the material (speech loses more than music), and
+// bounded, because it is a correction and not a second leveller.
+constexpr double compressionCompensationSeconds = 3.0;
+constexpr double compressionCompensationSmoothingSeconds = 1.0;
+constexpr float compressionCompensationRangeDb = 4.0f;
 // Compressor. A hard knee with the programme sitting near the threshold is the
 // classic source of breathing on speech, because every syllable crosses it.
 constexpr float compressorKneeDb = 8.0f;
+// Thresholds are set against the leveller's working level, not full scale. The
+// old -5 to -20 dBFS range was absolute, and recorded services reach the engine
+// at -30 to -45 dBFS RMS, so across two complete services the compressor
+// averaged 0.002 dB of gain reduction: present, enabled and doing nothing. With
+// the leveller in front, the programme arrives at the working level and these
+// become a real operating point. DYNAMICS moves the threshold down and the ratio
+// up together.
+constexpr float compressorThresholdAtMinimumDb = levelerWorkingLevelDb - 2.0f;
+constexpr float compressorThresholdRangeDb = 10.0f;
+constexpr float compressorRatioAtMinimum = 1.4f;
+constexpr float compressorRatioRange = 2.4f;
 constexpr double compressorMakeupSeconds = 0.50;
 // Not the full reduction. Returning all of it would undo the compression on
 // anything sustained; returning most of it keeps the level while still letting
@@ -188,7 +175,6 @@ void ProcessingEngine::prepare(double newSampleRate, int maximumBlockSize, int c
     for (auto* value : { &rumbleCutoff, &warmthGain, &lowGain, &mudGain, &clarityGain,
                          &harshGain, &sibilanceGain, &highGain, &outputGain })
         value->reset(sampleRate, 0.75);
-    levelerWeighting.prepare(sampleRate);
     configureDynamicBands();
     broadbandReferenceCoefficient = std::exp(-1.0f / static_cast<float>(sampleRate * broadbandReferenceSeconds));
     makeupCoefficient = std::exp(-1.0f / static_cast<float>(sampleRate * compressorMakeupSeconds));
@@ -201,20 +187,12 @@ void ProcessingEngine::prepare(double newSampleRate, int maximumBlockSize, int c
     // ~1.5 s integration: slow enough to track programme level instead of
     // individual syllables, fast enough to settle before the operator judges.
     loudnessMatchCoefficient = std::exp(-1.0f / static_cast<float>(sampleRate * 1.5));
-    // A Kalman gain of 1/(fs*tau) behaves like a one-pole with that time
-    // constant, and the steady-state relation K = sqrt(Q/R) inverts to give the
-    // process noise the filter needs to settle there.
-    kalmanSteadyGain = static_cast<float>(1.0 / (sampleRate * kalmanSteadySeconds));
-    kalmanFastGain = static_cast<float>(1.0 / (sampleRate * kalmanSectionChangeSeconds));
-    levelDetectorCoefficient = std::exp(-1.0f / static_cast<float>(sampleRate * kalmanDetectorSeconds));
-    innovationCoefficient = std::exp(-1.0f / static_cast<float>(sampleRate * kalmanInnovationSeconds));
-    loudnessAverageCoefficient = std::exp(-1.0f / static_cast<float>(sampleRate * loudnessAverageSeconds));
-    gateHoldSamples = static_cast<float>(sampleRate * levelerGateHoldSeconds);
-    sectionRebaseLength = static_cast<float>(sampleRate * levelerSectionRebaseSeconds);
-    levelTrendCoefficient = static_cast<float>(1.0 / (sampleRate * levelerVariationSeconds));
-    gateLevelCoefficient = static_cast<float>(1.0 / (sampleRate * levelerGateIntegrationSeconds));
-    silenceReleaseSamples = static_cast<float>(sampleRate * levelerSilenceReleaseSeconds);
-    silenceReleaseGain = static_cast<float>(1.0 / (sampleRate * levelerSilenceSlideSeconds));
+    levelTracker.prepare(sampleRate);
+    toneMatch.prepare(sampleRate);
+    monoSpread.prepare(sampleRate);
+    compressionOutputWeighting.prepare(sampleRate);
+    compressionAverageCoefficient = std::exp(-1.0f / static_cast<float>(sampleRate * compressionCompensationSeconds));
+    compensationSmoothing = std::exp(-1.0f / static_cast<float>(sampleRate * compressionCompensationSmoothingSeconds));
     stereoWidth.reset(sampleRate, 5.0);
     stereoBalance.reset(sampleRate, 5.0);
     // Slower than the Smart Engine width ramp. Correlation moves with every
@@ -259,6 +237,8 @@ void ProcessingEngine::resetProcessingState() noexcept
     dcPreviousOutput.fill(0.0f);
     for (auto& filter : rumbleFilters)
         filter.reset();
+    toneMatch.reset();
+    monoSpread.reset();
     warmthFilter.reset();
     lowFilter.reset();
     mudFilter.reset();
@@ -271,7 +251,6 @@ void ProcessingEngine::resetProcessingState() noexcept
     for (auto& band : dynamicBands)
         band.reset();
     broadbandReferenceSquare = 0.0f;
-    levelerWeighting.reset();
     correlationLeftRight = 0.0;
     correlationLeftSquare = 0.0;
     correlationRightSquare = 0.0;
@@ -294,24 +273,15 @@ void ProcessingEngine::resetProcessingState() noexcept
     lastMultibandLimiterReduction.fill(0.0f);
     lastCompressorReduction = 0.0f;
     lastLimiterReduction = 0.0f;
-    programmeLevelSquare = 0.0f;
-    programmeLevelGain = 1.0f;
-    // A large starting covariance is what lets the estimate lock onto the first
-    // real programme within a fraction of a second instead of creeping towards
-    // it with the steady-state time constant.
-    programmeLevelEstimateDb = -100.0f;
-    programmeLevelCovariance = kalmanInitialCovariance;
-    programmeInnovationAverage = 0.0f;
-    programmeLevelInitialised = false;
-    programmeLoudnessAverage = -100.0f;
-    loudnessSampleCount = 0.0f;
-    gateClosedSamples = 0.0f;
-    sectionRebaseSamples = 0.0f;
-    gateLevelDb = -100.0f;
-    programmeLevelTrend = -100.0f;
-    levelVariationDb = 0.0f;
-    levelerGateOpen = false;
-    silenceSamples = 0.0f;
+    levelTracker.reset();
+    levelTotalDb = 0.0f;
+    levelInputDb = 0.0f;
+    inputLevelGain = 1.0f;
+    outputLevelGain = 1.0f;
+    compressionOutputWeighting.reset();
+    compressionInputSquare = 0.0f;
+    compressionOutputSquare = 0.0f;
+    compensationDb = 0.0f;
     dryLoudnessSquare = 0.0;
     wetLoudnessSquare = 0.0;
     dryMatchGain.setCurrentAndTargetValue(1.0f);
@@ -357,6 +327,8 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
     const auto warmth = clampControl(parameters.warmth.load(std::memory_order_relaxed));
     const auto eqEnabled = parameters.adaptiveEqEnabled.load(std::memory_order_relaxed);
     const auto rumbleIsEnabled = parameters.rumbleEnabled.load(std::memory_order_relaxed);
+    const auto toneMatchIsActive = parameters.toneMatchEnabled.load(std::memory_order_relaxed)
+        && parameters.operatingMode.load(std::memory_order_relaxed) != static_cast<int>(OperatingMode::manual);
     const auto compressorIsEnabled = parameters.compressorEnabled.load(std::memory_order_relaxed);
     const auto saturationIsEnabled = parameters.saturationEnabled.load(std::memory_order_relaxed);
     const auto dynamicEqIsEnabled = eqEnabled
@@ -391,6 +363,7 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
     const auto levelerTargetDb = std::clamp(parameters.loudnessTarget.load(std::memory_order_relaxed),
                                             -30.0f, -8.0f);
     const auto failsafeForced = parameters.forceFailsafe.load(std::memory_order_relaxed);
+    const auto monoSpreadIsEnabled = parameters.monoSpreadEnabled.load(std::memory_order_relaxed);
     const auto monoCompatibility = parameters.monoCompatibilityEnabled.load(std::memory_order_relaxed)
         && activeChannels == 2;
     if (monoCompatibility)
@@ -420,9 +393,9 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
         coherenceWidth.setTargetValue(1.0f);
     }
 
-    const auto compressorThreshold = -5.0f - dynamics * 15.0f
+    const auto compressorThreshold = compressorThresholdAtMinimumDb - dynamics * compressorThresholdRangeDb
         + adaptiveTargets.compressionDb.load(std::memory_order_relaxed);
-    const auto compressorRatio = 1.10f + dynamics * 1.65f;
+    const auto compressorRatio = compressorRatioAtMinimum + dynamics * compressorRatioRange;
     const std::array<float, 4> bandThresholdOffset { 2.0f, 0.0f, -1.0f, -2.0f };
     const std::array<float, 4> baseAttackMs { 35.0f, 28.0f, 22.0f, 15.0f };
     const std::array<float, 4> releaseMs { 190.0f, 165.0f, 135.0f, 110.0f };
@@ -459,6 +432,7 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
     const auto processedSelected = !parameters.bypass.load(std::memory_order_relaxed)
         && parameters.abProcessed.load(std::memory_order_relaxed);
     wetMix.setTargetValue(processedSelected ? 1.0f : 0.0f);
+    const auto levelerActive = levelerIsEnabled && processedSelected;
 
     for (int sampleIndex = 0; sampleIndex < numSamples; ++sampleIndex)
     {
@@ -533,14 +507,53 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
         dynamicBands[dynamicHarsh].updateGain(dynamicDetector[dynamicHarsh], broadbandReferenceDb, dynamicEqIsEnabled);
         dynamicBands[dynamicSibilance].updateGain(dynamicDetector[dynamicSibilance], sibilanceReferenceDb, deEsserIsEnabled);
 
+        float levelled[maximumChannels] { 0.0f, 0.0f };
         for (int channel = 0; channel < activeChannels; ++channel)
         {
             auto value = toned[channel];
             for (int band = 0; band < dynamicBandCount; ++band)
                 value += (dynamicBands[static_cast<size_t>(band)].getGain() - 1.0f)
                     * dynamicSignal[band][channel];
+            levelled[channel] = value;
+        }
+
+        // The leveller measures here, ahead of the compressor, and applies the
+        // share of its gain that brings the programme to the working level.
+        // Silence walks the estimate back to the target, which is what returns
+        // the total gain to unity instead of leaving it armed for the next sound.
+        levelTracker.process(levelled, activeChannels, levelerTargetDb);
+        if (levelerActive)
+        {
+            // Recovery is capped so this cannot turn room noise into a
+            // programme even if the gate is fooled. A closed gate holds both
+            // gains where they were.
+            //
+            // The input share always aims at the working level, and when the
+            // total runs into the cap the shortfall comes off the output share.
+            // Taking it off the input instead left a very quiet sermon below
+            // every compressor threshold, so the one programme that most needed
+            // compressing got none.
+            if (levelTracker.isTracking())
+            {
+                levelTotalDb = std::clamp(levelerTargetDb - levelTracker.getEstimateDb(),
+                                          levelerMaximumCutDb, levelerMaximumBoostDb);
+                levelInputDb = std::clamp(levelerWorkingLevelDb - levelTracker.getEstimateDb(),
+                                          levelerMaximumCutDb - (levelerTargetDb - levelerWorkingLevelDb),
+                                          levelerMaximumBoostDb);
+            }
+        }
+        else
+        {
+            levelTotalDb = 0.0f;
+            levelInputDb = 0.0f;
+        }
+        const auto inputTargetGain = decibelsToGain(levelInputDb);
+        inputLevelGain = levelGainSmoothing * inputLevelGain + (1.0f - levelGainSmoothing) * inputTargetGain;
+
+        for (int channel = 0; channel < activeChannels; ++channel)
+        {
             float lowGroup = 0.0f, highGroup = 0.0f;
-            middleSplit.processSample(channel, value, lowGroup, highGroup);
+            middleSplit.processSample(channel, levelled[channel] * inputLevelGain, lowGroup, highGroup);
             lowSplit.processSample(channel, lowGroup, bands[channel][0], bands[channel][1]);
             highSplit.processSample(channel, highGroup, bands[channel][2], bands[channel][3]);
         }
@@ -690,6 +703,14 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
             original[channel] = dryBuffer.getSample(channel, sampleIndex);
         }
 
+        // ToneMatch sits after the dynamics, the way mastering EQ does: in front
+        // of a multiband compressor, a lift raises its band into more gain
+        // reduction and the compressor's thresholds pull the balance back
+        // towards their own. It measures what reaches it, before its own
+        // filters, so the correction depends on the programme and never on
+        // itself.
+        toneMatch.process(wet, activeChannels);
+
         // Coherence safety never widens: it can only take back what the Smart
         // Engine asked for, so the two controls cannot fight each other.
         const auto width = stereoWidth.getNextValue();
@@ -704,10 +725,17 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
             correlationRightSquare = correlationCoefficient * correlationRightSquare
                 + (1.0f - correlationCoefficient) * static_cast<double>(wet[1]) * wet[1];
         }
-        if (activeChannels == 2 && (monoCompatibility || safeWidth < 0.9999f))
+        // Added to the Side, so the mono sum is untouched; and ahead of the
+        // bass-mono filters and the width controls, so both still have the last
+        // word over it. It runs every sample so its detector and all-passes are
+        // settled whenever a mono feed appears.
+        const auto spreadSide = activeChannels == 2
+            ? monoSpread.process(original[0], original[1], 0.5f * (wet[0] + wet[1]), monoSpreadIsEnabled)
+            : 0.0f;
+        if (activeChannels == 2 && (monoCompatibility || safeWidth < 0.9999f || spreadSide != 0.0f))
         {
             const auto mid = 0.5f * (wet[0] + wet[1]);
-            auto side = 0.5f * (wet[0] - wet[1]);
+            auto side = 0.5f * (wet[0] - wet[1]) + spreadSide;
             if (monoCompatibility)
                 for (auto& filter : sideBassFilters)
                     side = filter.process(0, side);
@@ -721,154 +749,36 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
             wet[1] *= decibelsToGain(-balance * 0.5f);
         }
 
-        // Summed across channels, not averaged, because that is what BS.1770
-        // does and it is what makes the reading comparable to the LUFS number
-        // the operator set as a target. The detector is a one-pole rather than
-        // 400 ms blocks, so this is an approximation of loudness and not a
-        // conformant measurement, but it is weighted like one: a flat RMS on
-        // worship is dominated by the kick and the bass, and the same voice
-        // ends up levelled differently depending on what is playing under it.
-        auto programmePower = 0.0f;
+        // The rest of the leveller gain: working level to the operator's
+        // target, plus whatever loudness the compression took. The input side
+        // of the ratio is the same K-weighted power the tracker measured, with
+        // the input gain applied, so the two averages describe the same
+        // programme on either side of the compressor.
+        auto outputPower = 0.0f;
         for (int channel = 0; channel < activeChannels; ++channel)
         {
-            const auto weighted = levelerWeighting.process(channel, wet[channel]);
-            programmePower += weighted * weighted;
+            const auto weighted = compressionOutputWeighting.process(channel, wet[channel]);
+            outputPower += weighted * weighted;
         }
-        programmeLevelSquare = levelDetectorCoefficient * programmeLevelSquare
-            + (1.0f - levelDetectorCoefficient) * programmePower;
-        const auto measuredLevelDb = programmeLevelSquare > 1.0e-12f
-            ? gainToDecibels(std::sqrt(programmeLevelSquare)) + KWeighting::lufsOffsetDb
-            : -100.0f;
-
-        gateLevelDb += gateLevelCoefficient * (measuredLevelDb - gateLevelDb);
-        sectionRebaseSamples = std::max(0.0f, sectionRebaseSamples - 1.0f);
-
-        // Tracked whether the gate is open or not: deciding what a closed gate
-        // is looking at is exactly what this is for.
-        programmeLevelTrend += levelTrendCoefficient * (measuredLevelDb - programmeLevelTrend);
-        levelVariationDb += levelTrendCoefficient
-            * (std::abs(measuredLevelDb - programmeLevelTrend) - levelVariationDb);
-
-        // Gate first. A closed gate freezes both the estimate and the gain, so
-        // a pause cannot drag the programme level down and then be levelled
-        // back up as room noise when the speaker stops.
-        if (gateLevelDb > levelerAbsoluteGateDb)
+        if (levelTracker.isGateOpen())
         {
-            silenceSamples = 0.0f;
-            loudnessSampleCount += 1.0f;
-            // Cumulative mean while the window is still filling, exponential
-            // afterwards. BS.1770 averages every gated block for the same
-            // reason: the relative gate is meaningless until the reference it
-            // is relative to actually reflects the programme.
-            const auto alpha = std::max(1.0f / loudnessSampleCount, 1.0f - loudnessAverageCoefficient);
-            programmeLoudnessAverage += alpha * (gateLevelDb - programmeLoudnessAverage);
-            // Both sides of the comparison are integrated. Syllables swing about
-            // 12 dB peak to valley, wider than the 10 dB relative gate, so
-            // gating on the fast detector makes every loud phrase close the gate
-            // on its own quiet half. BS.1770 gates on 400 ms blocks for exactly
-            // this reason.
-            const auto relativeThreshold = programmeLoudnessAverage - levelerRelativeGateDb
-                + (levelerGateOpen ? 0.0f : levelerGateHysteresisDb);
-            levelerGateOpen = gateLevelDb > relativeThreshold;
+            const auto inputPower = levelTracker.getLastPower() * inputLevelGain * inputLevelGain;
+            compressionInputSquare = compressionAverageCoefficient * compressionInputSquare
+                + (1.0f - compressionAverageCoefficient) * inputPower;
+            compressionOutputSquare = compressionAverageCoefficient * compressionOutputSquare
+                + (1.0f - compressionAverageCoefficient) * outputPower;
         }
-        else
-        {
-            silenceSamples += 1.0f;
-            levelerGateOpen = false;
-        }
-
-        if (levelerGateOpen)
-        {
-            gateClosedSamples = 0.0f;
-        }
-        else if (silenceSamples <= 0.0f)
-        {
-            // Only counted while there is still programme present. Real silence
-            // is handled by the release path below, not by rebasing onto it.
-            if (gateClosedSamples <= 0.0f)
-            {
-                // The measurement window starts here. The step that closed the
-                // gate is itself a large deviation, and letting it into the
-                // variation would make every pause look like speech for the
-                // first few seconds -- which is precisely the span being judged.
-                programmeLevelTrend = measuredLevelDb;
-                levelVariationDb = 0.0f;
-            }
-            gateClosedSamples += 1.0f;
-            if (gateClosedSamples > gateHoldSamples && levelVariationDb > levelerSpeechVariationDb)
-            {
-                programmeLoudnessAverage = gateLevelDb;
-                loudnessSampleCount = 1.0f;
-                levelerGateOpen = true;
-                gateClosedSamples = 0.0f;
-                // The gate has just concluded this is a new section. Making the
-                // filter rediscover that from its own innovation would waste the
-                // second it takes to build up, and the conclusion is already in
-                // hand: hand it over.
-                programmeInnovationAverage = kalmanInnovationCeilingDb;
-                sectionRebaseSamples = sectionRebaseLength;
-            }
-        }
-
-        if (levelerGateOpen)
-        {
-            if (!programmeLevelInitialised)
-            {
-                programmeLevelEstimateDb = measuredLevelDb;
-                programmeLevelInitialised = true;
-            }
-
-            const auto innovation = measuredLevelDb - programmeLevelEstimateDb;
-            programmeInnovationAverage = innovationCoefficient * programmeInnovationAverage
-                + (1.0f - innovationCoefficient) * std::abs(innovation);
-            // Sustained innovation means the programme really moved, not that a
-            // syllable was loud. Only then is it worth abandoning the slow
-            // estimate, which is the whole anti-pumping argument.
-            // Rising programme is unambiguous -- the mix got louder and the
-            // gain has to come down now -- so it may always accelerate. Falling
-            // programme may not, unless the gate has already accepted it as a
-            // section rather than a pause.
-            const auto mayAccelerate = innovation > 0.0f || sectionRebaseSamples > 0.0f;
-            const auto sectionChange = mayAccelerate
-                ? std::clamp((programmeInnovationAverage - kalmanInnovationFloorDb)
-                                 / (kalmanInnovationCeilingDb - kalmanInnovationFloorDb), 0.0f, 1.0f)
-                : 0.0f;
-            const auto steadyStateGain = kalmanSteadyGain
-                + sectionChange * (kalmanFastGain - kalmanSteadyGain);
-            const auto processNoise = steadyStateGain * steadyStateGain * kalmanMeasurementNoise;
-
-            const auto predictedCovariance = programmeLevelCovariance + processNoise;
-            const auto kalmanGain = predictedCovariance / (predictedCovariance + kalmanMeasurementNoise);
-            programmeLevelEstimateDb += kalmanGain * innovation;
-            programmeLevelCovariance = (1.0f - kalmanGain) * predictedCovariance;
-        }
-        else if (programmeLevelInitialised && silenceSamples > silenceReleaseSamples)
-        {
-            // Standing down is expressed as the estimate drifting to the
-            // target, not as an override on the gain: one state variable stays
-            // in charge, so when programme returns the gain is already
-            // continuous and the Kalman simply picks up from where it is.
-            programmeLevelEstimateDb += silenceReleaseGain
-                * (levelerTargetDb - programmeLevelEstimateDb);
-            // Nothing has been measured for over a second, so the estimate is
-            // worth very little. Saying so is what lets it re-lock quickly.
-            programmeLevelCovariance = kalmanInitialCovariance;
-            programmeInnovationAverage = 0.0f;
-        }
-
-        // Recovery is capped so this cannot turn room noise into a programme
-        // even if the gate is fooled.
-        auto levelTargetGain = programmeLevelGain;
-        if (levelerIsEnabled && processedSelected && programmeLevelInitialised
-            && (levelerGateOpen || silenceSamples > silenceReleaseSamples))
-            levelTargetGain = decibelsToGain(std::clamp(levelerTargetDb - programmeLevelEstimateDb,
-                                                        levelerMaximumCutDb, levelerMaximumBoostDb));
-        else if (!levelerIsEnabled || !processedSelected)
-            levelTargetGain = 1.0f;
-        programmeLevelGain = levelGainSmoothing * programmeLevelGain
-            + (1.0f - levelGainSmoothing) * levelTargetGain;
+        auto compensationTargetDb = compensationDb;
+        if (!levelerActive || levelTracker.isInSilence())
+            compensationTargetDb = 0.0f;
+        else if (levelTracker.isGateOpen() && compressionInputSquare > 1.0e-12f && compressionOutputSquare > 1.0e-12f)
+            compensationTargetDb = std::clamp(10.0f * std::log10(compressionInputSquare / compressionOutputSquare),
+                                              -compressionCompensationRangeDb, compressionCompensationRangeDb);
+        compensationDb = compensationSmoothing * compensationDb + (1.0f - compensationSmoothing) * compensationTargetDb;
+        const auto outputTargetGain = decibelsToGain(levelTotalDb - levelInputDb + compensationDb);
+        outputLevelGain = levelGainSmoothing * outputLevelGain + (1.0f - levelGainSmoothing) * outputTargetGain;
         for (int channel = 0; channel < activeChannels; ++channel)
-            wet[channel] *= programmeLevelGain;
+            wet[channel] *= outputLevelGain;
 
         auto detectedTruePeak = 0.0f;
         for (int channel = 0; channel < activeChannels; ++channel)
@@ -981,6 +891,12 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
             dryDelayWritePosition = 0;
     }
 
+    // Programme is judged by the leveller's gate, so a prayer pause or the room
+    // between songs is not measured as a dull mix.
+    toneMatch.endBlock(levelTracker.isGateOpen(), toneMatchIsActive);
+    for (size_t control = 0; control < ToneMatch::controlCount; ++control)
+        metrics.toneMatchGainDb[control].store(toneMatch.getGainsDb()[control], std::memory_order_release);
+
     lastCompressorReduction = std::max(blockMaxCompressorReduction, lastCompressorReduction * 0.92f);
     lastLimiterReduction = std::max(blockMaxLimiterReduction, lastLimiterReduction * 0.90f);
     for (size_t band = 0; band < multibandLimiterBandCount; ++band)
@@ -996,16 +912,17 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
     metrics.deEsserReductionDb.store(blockMaxDeEsser, std::memory_order_release);
     metrics.dynamicEqReductionDb.store(blockMaxDynamicEq, std::memory_order_release);
     metrics.compressorMakeupDb.store(gainToDecibels(blockMaxMakeup, 0.0f), std::memory_order_release);
-    metrics.broadcastLevelGainDb.store(gainToDecibels(programmeLevelGain), std::memory_order_release);
+    metrics.broadcastLevelGainDb.store(gainToDecibels(inputLevelGain * outputLevelGain), std::memory_order_release);
     metrics.abMatchGainDb.store(gainToDecibels(dryMatchGain.getCurrentValue(), -24.0f), std::memory_order_release);
     metrics.failsafeActive.store(failsafeBlend > 0.0f, std::memory_order_release);
     metrics.failsafeEngagements.store(failsafeEngagementCount, std::memory_order_release);
     metrics.nonFiniteInputSamples.store(nonFiniteInputCount, std::memory_order_release);
     metrics.programmeCorrelation.store(measuredCorrelation, std::memory_order_release);
+    metrics.monoSpreadWeight.store(monoSpread.getWeight(), std::memory_order_release);
     metrics.appliedStereoWidth.store(std::min(stereoWidth.getCurrentValue(), coherenceWidth.getCurrentValue()),
                                      std::memory_order_release);
-    metrics.programmeLevelDb.store(programmeLevelEstimateDb, std::memory_order_release);
-    metrics.levelerGateOpen.store(levelerGateOpen, std::memory_order_release);
+    metrics.programmeLevelDb.store(levelTracker.getEstimateDb(), std::memory_order_release);
+    metrics.levelerGateOpen.store(levelTracker.isGateOpen(), std::memory_order_release);
 }
 
 void ProcessingEngine::updateLoudnessMatch(float dryMono, float wetMono) noexcept

@@ -33,6 +33,14 @@ public:
     // same decision code as the background thread and never touches audio.
     void processSnapshotForTesting(const AnalysisSnapshot& snapshot, float elapsedSeconds);
 
+    // The processed metrics as they would be without ToneMatch. ToneMatch owns
+    // the long-term balance against a fixed curve; the Smart Engine reacts to
+    // deviations from the church's own baseline. Judging the processed output
+    // as it stands, every lift ToneMatch made would read as an excess for the
+    // Smart Engine to cut, and the two would pull against each other.
+    [[nodiscard]] static SignalMetrics withoutToneMatch(const SignalMetrics& processed, double sampleRate,
+                                                        const std::array<float, ToneMatch::controlCount>& gains);
+
 private:
     struct Baseline
     {

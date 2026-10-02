@@ -98,8 +98,65 @@ void SmartEngine::run()
     }
 }
 
-void SmartEngine::update(const AnalysisSnapshot& snapshot, float elapsedSeconds)
+SignalMetrics SmartEngine::withoutToneMatch(const SignalMetrics& processed, double sampleRate,
+                                            const std::array<float, ToneMatch::controlCount>& gains)
 {
+    auto flat = true;
+    for (const auto gain : gains)
+        flat = flat && std::abs(gain) < 0.05f;
+    if (flat || sampleRate <= 0.0)
+        return processed;
+
+    // ToneMatch's share of each band is taken out as a ratio, applied to the
+    // analyser's own band values, so the result stays on AnalysisEngine's scale
+    // exactly. Rebuilding the bands from the per-bin spectrum instead would
+    // inherit its -100 dB floor and shift the absolute levels the moment
+    // ToneMatch stopped being flat.
+    auto result = processed;
+    const auto filters = ToneMatch::makeFilters(gains, sampleRate);
+    std::array<double, 5> withMatch {};
+    std::array<double, 5> withoutMatch {};
+    double weightedFrequency = 0.0;
+    double magnitudeSum = 0.0;
+    for (int bin = 1; bin < spectrumBins; ++bin)
+    {
+        const auto frequency = static_cast<double>(bin) * sampleRate / static_cast<double>(fftSize);
+        auto& level = result.spectrumDb[static_cast<size_t>(bin)];
+        const auto original = std::pow(10.0, static_cast<double>(level) / 10.0);
+        level -= ToneMatch::responseDb(filters, sampleRate, static_cast<float>(frequency));
+        const auto magnitude = std::pow(10.0, static_cast<double>(level) / 20.0);
+        const auto band = frequency < 120.0 ? 0 : frequency < 500.0 ? 1 : frequency < 2500.0 ? 2
+            : frequency < 8000.0 ? 3 : 4;
+        withMatch[static_cast<size_t>(band)] += original;
+        withoutMatch[static_cast<size_t>(band)] += magnitude * magnitude;
+        weightedFrequency += frequency * magnitude;
+        magnitudeSum += magnitude;
+    }
+    std::array<double, 5> shares {};
+    double shareTotal = 0.0;
+    for (size_t band = 0; band < shares.size(); ++band)
+    {
+        const auto ratio = withMatch[band] > 1.0e-30 ? withoutMatch[band] / withMatch[band] : 1.0;
+        shares[band] = static_cast<double>(processed.bandEnergy[band]) * ratio;
+        shareTotal += shares[band];
+        if (processed.bandLevelDb[band] > -90.0f)
+            result.bandLevelDb[band] = processed.bandLevelDb[band] + static_cast<float>(10.0 * std::log10(ratio));
+    }
+    for (size_t band = 0; band < shares.size(); ++band)
+        result.bandEnergy[band] = shareTotal > 1.0e-18 ? static_cast<float>(shares[band] / shareTotal) : 0.0f;
+    if (magnitudeSum > 1.0e-12)
+        result.spectralCentroidHz = static_cast<float>(weightedFrequency / magnitudeSum);
+    return result;
+}
+
+void SmartEngine::update(const AnalysisSnapshot& rawSnapshot, float elapsedSeconds)
+{
+    std::array<float, ToneMatch::controlCount> toneMatchGains {};
+    for (size_t control = 0; control < toneMatchGains.size(); ++control)
+        toneMatchGains[control] = processing.getMetrics().toneMatchGainDb[control].load(std::memory_order_acquire);
+    auto snapshot = rawSnapshot;
+    snapshot.processed = withoutToneMatch(rawSnapshot.processed, rawSnapshot.sampleRate, toneMatchGains);
+
     if (autoTuneRequested.exchange(false, std::memory_order_acq_rel))
     {
         autoTuneAccumulator = {};

@@ -131,6 +131,24 @@ public:
         a2 = static_cast<float>((1.0 - alpha / amplitude) / a0);
     }
 
+    // Magnitude response at `frequency`, evaluated from the current
+    // coefficients on the unit circle.
+    [[nodiscard]] double magnitudeDb(double sampleRate, double frequency) const noexcept
+    {
+        if (sampleRate <= 0.0)
+            return 0.0;
+        const auto omega = 2.0 * std::numbers::pi * frequency / sampleRate;
+        const auto c1 = std::cos(omega), s1 = std::sin(omega);
+        const auto c2 = std::cos(2.0 * omega), s2 = std::sin(2.0 * omega);
+        const auto numeratorReal = b0 + b1 * c1 + b2 * c2;
+        const auto numeratorImaginary = b1 * s1 + b2 * s2;
+        const auto denominatorReal = 1.0 + a1 * c1 + a2 * c2;
+        const auto denominatorImaginary = a1 * s1 + a2 * s2;
+        const auto numerator = numeratorReal * numeratorReal + numeratorImaginary * numeratorImaginary;
+        const auto denominator = denominatorReal * denominatorReal + denominatorImaginary * denominatorImaginary;
+        return denominator > 1.0e-30 && numerator > 1.0e-30 ? 10.0 * std::log10(numerator / denominator) : 0.0;
+    }
+
     float process(int channel, float input) noexcept
     {
         const auto index = static_cast<size_t>(std::clamp(channel, 0, 1));

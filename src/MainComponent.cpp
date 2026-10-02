@@ -354,6 +354,7 @@ MainComponent::MainComponent(bool startAudio)
         menu.addItem(5, protectLimiter ? "True-peak limiter (LIVE SAFE)" : "True-peak limiter",
                      !protectLimiter, parameters.limiterEnabled.load());
         menu.addItem(6, "Broadcast programme leveller", true, parameters.broadcastLevelerEnabled.load());
+        menu.addItem(9, "Tone match (target curve)", true, parameters.toneMatchEnabled.load());
         juce::PopupMenu scenes;
         const auto selectedScene = static_cast<SmartScene>(static_cast<int>(settings.getNumber("smartScene", 0.0)));
         for (int scene = 0; scene <= static_cast<int>(SmartScene::ambience); ++scene)
@@ -395,6 +396,7 @@ MainComponent::MainComponent(bool startAudio)
             else if (selected == 6) toggle(p.broadcastLevelerEnabled, "broadcastLevelerEnabled");
             else if (selected == 7) toggle(p.dynamicEqEnabled, "dynamicEqEnabled");
             else if (selected == 8) toggle(p.deEsserEnabled, "deEsserEnabled");
+            else if (selected == 9) toggle(p.toneMatchEnabled, "toneMatchEnabled");
             else if (selected == 200)
             {
                 const auto enabled = !audioEngine.isSmartMaskingEnabled();
@@ -1176,6 +1178,8 @@ void MainComponent::updateDspControls()
                                     std::memory_order_release);
     parameters.broadcastLevelerEnabled.store(settings.getNumber("broadcastLevelerEnabled", 1.0) > 0.5,
                                               std::memory_order_release);
+    parameters.toneMatchEnabled.store(settings.getNumber("toneMatchEnabled", 1.0) > 0.5,
+                                      std::memory_order_release);
     presetSelector.onChange = [this]
     {
         const auto selected = presetSelector.getSelectedItemIndex();

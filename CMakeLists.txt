@@ -73,6 +73,9 @@ target_sources(ChurchStreamProcessor PRIVATE
     src/DSP/KWeighting.h
     src/DSP/ProcessingEngine.cpp
     src/DSP/ProcessingEngine.h
+    src/DSP/ProgrammeLevelTracker.h
+    src/DSP/ToneMatch.h
+    src/DSP/MonoSpread.h
     src/DSP/TruePeakDetector.h
     src/Settings/AppSettings.cpp
     src/Settings/AppSettings.h
@@ -182,6 +185,9 @@ if(BUILD_TESTING)
     src/DSP/KWeighting.h
         src/DSP/ProcessingEngine.cpp
         src/DSP/ProcessingEngine.h
+        src/DSP/ProgrammeLevelTracker.h
+        src/DSP/ToneMatch.h
+        src/DSP/MonoSpread.h
         src/DSP/TruePeakDetector.h
         src/Smart/SmartEngine.cpp
         src/Smart/SmartEngine.h
@@ -249,6 +255,9 @@ if(BUILD_TESTING)
     src/DSP/KWeighting.h
         src/DSP/ProcessingEngine.cpp
         src/DSP/ProcessingEngine.h
+        src/DSP/ProgrammeLevelTracker.h
+        src/DSP/ToneMatch.h
+        src/DSP/MonoSpread.h
         src/DSP/TruePeakDetector.h
     )
     target_include_directories(ChurchStreamProcessorBenchmark PRIVATE src)
@@ -262,6 +271,40 @@ if(BUILD_TESTING)
     target_compile_definitions(ChurchStreamProcessorBenchmark PRIVATE JUCE_USE_CURL=0 JUCE_WEB_BROWSER=0)
     target_link_libraries(ChurchStreamProcessorBenchmark PRIVATE
         juce::juce_audio_basics
+        juce::juce_core
+        juce::juce_dsp
+        juce::juce_recommended_config_flags
+        juce::juce_recommended_lto_flags
+        juce::juce_recommended_warning_flags
+    )
+
+    # Renders a recorded service through the real DSP chain with application
+    # defaults, so dynamics changes can be judged on real programme.
+    juce_add_console_app(ChurchStreamProcessorRender
+        PRODUCT_NAME "Church Stream Processor Render"
+    )
+    target_sources(ChurchStreamProcessorRender PRIVATE
+        tests/RenderFile.cpp
+        src/DSP/Biquad.h
+        src/DSP/DspParameters.h
+        src/DSP/DynamicBand.h
+        src/DSP/KWeighting.h
+        src/DSP/ProcessingEngine.cpp
+        src/DSP/ProcessingEngine.h
+        src/DSP/ProgrammeLevelTracker.h
+        src/DSP/ToneMatch.h
+        src/DSP/MonoSpread.h
+        src/DSP/TruePeakDetector.h
+    )
+    target_include_directories(ChurchStreamProcessorRender PRIVATE src)
+    target_compile_features(ChurchStreamProcessorRender PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(ChurchStreamProcessorRender PRIVATE /utf-8 /permissive-)
+    endif()
+    target_compile_definitions(ChurchStreamProcessorRender PRIVATE JUCE_USE_CURL=0 JUCE_WEB_BROWSER=0)
+    target_link_libraries(ChurchStreamProcessorRender PRIVATE
+        juce::juce_audio_basics
+        juce::juce_audio_formats
         juce::juce_core
         juce::juce_dsp
         juce::juce_recommended_config_flags

@@ -90,6 +90,11 @@ private:
         float loudnessTarget = -14.0f;
         int operatingMode = 1;
         bool rumble = true, eq = true, compressor = true, saturation = true, limiter = true;
+        // Copied as well, so an offline test runs the chain the stream runs.
+        // Without them the leveller -- off by default in DspParameters, on by
+        // default in the application -- was missing from every offline render.
+        bool dynamicEq = true, deEsser = true, leveller = true, toneMatch = true;
+        bool monoCompatibility = true, phaseCoherence = true;
     };
 
     struct MetricAccumulator

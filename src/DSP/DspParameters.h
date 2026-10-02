@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 
@@ -37,6 +38,9 @@ struct DspParameters final
     std::atomic<float> analystSibilanceOffsetDb { 0.0f };
 
     std::atomic<bool> rumbleEnabled { true };
+    // Slow EQ towards a fixed target curve (ToneMatch). Automatic, so it stands
+    // down in MANUAL like the Smart Engine does.
+    std::atomic<bool> toneMatchEnabled { true };
     std::atomic<bool> adaptiveEqEnabled { true };
     std::atomic<bool> compressorEnabled { true };
     std::atomic<bool> saturationEnabled { true };
@@ -80,6 +84,9 @@ struct DspParameters final
     // Correlation-driven width safety. Enabled separately from bass mono: it
     // reacts to the programme rather than applying a fixed rule.
     std::atomic<bool> phaseCoherenceEnabled { true };
+    // Width for a mono console feed (MonoSpread). Only engages when the input
+    // is mono, and never changes the mono sum.
+    std::atomic<bool> monoSpreadEnabled { true };
 };
 
 struct AdaptiveTargets final
@@ -110,6 +117,9 @@ struct DspMetrics final
     // can tell a de-esser that is working from one that is sitting on the whole
     // top end.
     std::atomic<float> deEsserReductionDb { 0.0f };
+    // ToneMatch gains: low shelf 120 Hz, 280 Hz, 3.2 kHz, 7 kHz, high shelf
+    // 12 kHz. Published so the Smart Engine can judge the mix without them.
+    std::array<std::atomic<float>, 5> toneMatchGainDb {};
     std::atomic<float> dynamicEqReductionDb { 0.0f };
     std::atomic<float> compressorMakeupDb { 0.0f };
     std::atomic<float> broadcastLevelGainDb { 0.0f };
@@ -118,6 +128,9 @@ struct DspMetrics final
     // engine actually applied after coherence safety.
     std::atomic<float> programmeCorrelation { 1.0f };
     std::atomic<float> appliedStereoWidth { 1.0f };
+    // 0 when the input is stereo or MonoSpread is off, 1 when a mono feed is
+    // being fully spread.
+    std::atomic<float> monoSpreadWeight { 0.0f };
     // Kalman estimate of programme level, and whether the leveler gate is open.
     // A closed gate means the leveler is deliberately doing nothing.
     std::atomic<float> programmeLevelDb { -100.0f };

@@ -190,6 +190,9 @@ CSP_TEST_CASE void testFourBandRecombinationIsLevelNeutral()
     parameters.compressorEnabled.store(false);
     parameters.saturationEnabled.store(false);
     parameters.limiterEnabled.store(false);
+    // The tone is mono, and one channel of a spread mono feed is deliberately
+    // not the input: only the sum is. This test is about the crossover.
+    parameters.monoSpreadEnabled.store(false);
 
     std::vector<float> left(blockSize), right(blockSize);
     float* channels[] { left.data(), right.data() };
@@ -1538,6 +1541,10 @@ CSP_TEST_CASE void renderAbComparison(bool matchEnabled, float& processedRmsDb, 
     parameters.saturationEnabled.store(false);
     parameters.limiterEnabled.store(false);
     parameters.adaptiveEqEnabled.store(false);
+    // ToneMatch would spend the whole render turning white noise towards its
+    // target, and a level still moving under the match integrator says nothing
+    // about the match itself.
+    parameters.toneMatchEnabled.store(false);
     engine.getAdaptiveTargets().loudnessGainDb.store(3.0f);
 
     uint32_t noise = 0x1234567u;
@@ -1629,7 +1636,11 @@ CSP_TEST_CASE void testWatchdogFailsafeAndInputSanitising()
             : -100.0f;
     };
 
-    const auto referenceRmsDb = render(40, 20);
+    // Every comparison is made in steady state. The tone sits well above the
+    // compressor threshold, so the reduction and its makeup (0.5 s) are still
+    // moving for the first second; a reference taken inside that window differs
+    // from a later one by the settling alone, not by anything the watchdog did.
+    const auto referenceRmsDb = render(400, 380);
     expect(!metrics.failsafeActive.load(), "the watchdog must stay out of the way on healthy audio");
     expect(metrics.failsafeEngagements.load() == 0u,
            "healthy programme must never be counted as a DSP fault");
@@ -1646,7 +1657,7 @@ CSP_TEST_CASE void testWatchdogFailsafeAndInputSanitising()
            "the failsafe path must carry the dry signal, not silence or a gain-matched copy");
 
     parameters.forceFailsafe.store(false);
-    const auto recoveredRmsDb = render(120, 100);
+    const auto recoveredRmsDb = render(400, 380);
     expect(!metrics.failsafeActive.load(), "the engine must return to the processed path when released");
     expect(std::abs(recoveredRmsDb - referenceRmsDb) < 1.0f,
            "the processed path must sound the same after a failsafe as before it");
@@ -1683,7 +1694,7 @@ CSP_TEST_CASE void testWatchdogFailsafeAndInputSanitising()
     // The real test of the watchdog is not the glitch block itself but what
     // comes after it: a poisoned recursive state would keep the output dead or
     // broken long after the input recovered.
-    const auto afterFaultRmsDb = render(120, 100);
+    const auto afterFaultRmsDb = render(400, 380);
     expect(allFinite, "no non-finite sample may ever reach the output");
     expect(worstOutput < 5.0f, "the engine must never emit an absurd magnitude");
     expect(std::abs(afterFaultRmsDb - referenceRmsDb) < 1.0f,
@@ -2993,6 +3004,408 @@ CSP_TEST_CASE void testKWeightedLevelerIgnoresSubBassWeighting()
            "the leveller detector must weight low frequencies the way a listener does");
 }
 
+// A sermon-like signal: two speech-band partials under a peaky 2.5 Hz syllable
+// envelope that falls to almost nothing between syllables, with a 250 ms gap
+// between words. The level moves far more inside a few hundred milliseconds
+// than any music does, which is exactly what separates an average of decibels
+// from an average of power.
+float sermonSample(int64_t index, double sampleRate, float amplitude)
+{
+    const auto pi = juce::MathConstants<double>::pi;
+    const auto t = static_cast<double>(index) / sampleRate;
+    const auto word = std::fmod(t, 0.8) < 0.55 ? 1.0 : 0.0;
+    const auto syllable = word * std::pow(std::abs(std::sin(2.0 * pi * 2.5 * t)), 3.0);
+    return static_cast<float>(amplitude * syllable
+                              * (std::sin(2.0 * pi * 1000.0 * t) + 0.5 * std::sin(2.0 * pi * 2400.0 * t)));
+}
+
+// A worship-like signal: low, mid and high partials with only a slow +/-2 dB
+// swell, the way a sustained band moves.
+float worshipSample(int64_t index, double sampleRate, float amplitude)
+{
+    const auto pi = juce::MathConstants<double>::pi;
+    const auto t = static_cast<double>(index) / sampleRate;
+    const auto swell = std::pow(10.0, 2.0 * std::sin(2.0 * pi * 0.5 * t) / 20.0);
+    return static_cast<float>(amplitude * swell
+                              * (std::sin(2.0 * pi * 220.0 * t) + 0.5 * std::sin(2.0 * pi * 1200.0 * t)
+                                 + 0.25 * std::sin(2.0 * pi * 3000.0 * t)));
+}
+
+void configureDefaultChain(churchstream::ProcessingEngine& engine)
+{
+    // The application's chain with the leveller on, as it ships. The Smart
+    // Engine is not running, so its adaptive targets stay neutral.
+    auto& p = engine.getParameters();
+    p.smartProcessing.store(false);
+    p.broadcastLevelerEnabled.store(true);
+    p.loudnessTarget.store(-14.0f);
+}
+
+CSP_TEST_CASE void testSermonAndWorshipLandAtTheSameLoudness()
+{
+    // Two recorded services had their sermon 10 and 16 dB under the worship.
+    // The leveller has to bring both sections to the target, and the sermon
+    // must not end up above the music either: averaging a fast detector in
+    // decibels read speech 4-5 dB quieter than it was, so a sermon that was
+    // not limited by the recovery range came out louder than the worship.
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 256;
+    auto engine = std::make_unique<churchstream::ProcessingEngine>();
+    engine->prepare(sampleRate, blockSize, 2);
+    configureDefaultChain(*engine);
+
+    const auto section = [&](double seconds, double measuredSeconds, const std::function<float(int64_t)>& generate) {
+        auto* meter = ebur128_init(2, static_cast<unsigned long>(sampleRate), EBUR128_MODE_I);
+        std::vector<float> left(blockSize), right(blockSize), interleaved(2 * blockSize);
+        float* channels[] { left.data(), right.data() };
+        const auto blocks = static_cast<int>(seconds * sampleRate / blockSize);
+        const auto measuredFrom = blocks - static_cast<int>(measuredSeconds * sampleRate / blockSize);
+        int64_t index = 0;
+        for (int block = 0; block < blocks; ++block)
+        {
+            for (int sample = 0; sample < blockSize; ++sample)
+            {
+                const auto value = generate(index++);
+                left[static_cast<size_t>(sample)] = value;
+                right[static_cast<size_t>(sample)] = value;
+            }
+            engine->process(channels, 2, blockSize);
+            if (block < measuredFrom)
+                continue;
+            for (int sample = 0; sample < blockSize; ++sample)
+            {
+                interleaved[static_cast<size_t>(2 * sample)] = left[static_cast<size_t>(sample)];
+                interleaved[static_cast<size_t>(2 * sample + 1)] = right[static_cast<size_t>(sample)];
+            }
+            ebur128_add_frames_float(meter, interleaved.data(), static_cast<size_t>(blockSize));
+        }
+        double loudness = -100.0;
+        ebur128_loudness_global(meter, &loudness);
+        ebur128_destroy(&meter);
+        return static_cast<float>(loudness);
+    };
+
+    const auto worship = section(30.0, 15.0, [&](int64_t index) { return worshipSample(index, sampleRate, 0.08f); });
+    const auto sermon = section(40.0, 15.0, [&](int64_t index) { return sermonSample(index, sampleRate, 0.03f); });
+    expect(std::abs(worship + 14.0f) < 1.5f, "worship must be levelled to the operator's loudness target");
+    expect(std::abs(sermon - worship) < 1.5f,
+           "a sermon well below the worship must come out at the same loudness, neither under nor over it");
+}
+
+CSP_TEST_CASE void testCompressorWorksWhateverTheConsoleSends()
+{
+    // The compressor thresholds used to be absolute, and recorded services
+    // reach the engine at -30 to -45 dBFS RMS, so it measured 0.002 dB of gain
+    // reduction across two complete services. With the leveller in front the
+    // compressor sees the working level whatever the console sends, including
+    // a feed so quiet that the total recovery runs into its limit.
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 256;
+    const auto reductionFor = [&](float amplitude) {
+        auto engine = std::make_unique<churchstream::ProcessingEngine>();
+        engine->prepare(sampleRate, blockSize, 2);
+        configureDefaultChain(*engine);
+        std::vector<float> left(blockSize), right(blockSize);
+        float* channels[] { left.data(), right.data() };
+        const auto blocks = static_cast<int>(25.0 * sampleRate / blockSize);
+        const auto measuredFrom = blocks - static_cast<int>(5.0 * sampleRate / blockSize);
+        int64_t index = 0;
+        double reduction = 0.0;
+        int counted = 0;
+        for (int block = 0; block < blocks; ++block)
+        {
+            for (int sample = 0; sample < blockSize; ++sample)
+            {
+                const auto value = sermonSample(index++, sampleRate, amplitude);
+                left[static_cast<size_t>(sample)] = value;
+                right[static_cast<size_t>(sample)] = value;
+            }
+            engine->process(channels, 2, blockSize);
+            if (block >= measuredFrom)
+            {
+                reduction += engine->getMetrics().compressorGainReductionDb.load();
+                ++counted;
+            }
+        }
+        return static_cast<float>(reduction / std::max(1, counted));
+    };
+
+    // About -34 LUFS, and about -43 LUFS: the second needs 29 dB to reach the
+    // target, more than the +24 dB the leveller may recover, so the target is
+    // out of reach; the shortfall must come off after the compressor rather
+    // than from its input.
+    const auto ordinary = reductionFor(0.030f);
+    const auto veryQuiet = reductionFor(0.014f);
+    expect(ordinary > 1.5f, "the compressor must actually engage on an ordinary console feed");
+    expect(std::abs(veryQuiet - ordinary) < 1.0f,
+           "a feed beyond the leveller's recovery range must still reach the compressor at the working level");
+}
+
+// Runs `seconds` of mono programme through a ToneMatch and two inactive
+// ToneMatch instances used purely as meters of its input and output balance.
+struct ToneMatchRun
+{
+    float inputError = 0.0f;
+    float outputError = 0.0f;
+    std::array<float, churchstream::ToneMatch::controlCount> gains {};
+};
+
+ToneMatchRun runToneMatch(churchstream::ToneMatch& match, double seconds, bool active,
+                          const std::function<float()>& generate)
+{
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 256;
+    churchstream::ToneMatch inputMeter, outputMeter;
+    inputMeter.prepare(sampleRate);
+    outputMeter.prepare(sampleRate);
+    const auto blocks = static_cast<int>(seconds * sampleRate / blockSize);
+    for (int block = 0; block < blocks; ++block)
+    {
+        for (int sample = 0; sample < blockSize; ++sample)
+        {
+            const auto value = generate();
+            float input[2] { value, value };
+            float frame[2] { value, value };
+            inputMeter.process(input, 2);
+            match.process(frame, 2);
+            outputMeter.process(frame, 2);
+        }
+        inputMeter.endBlock(true, false);
+        match.endBlock(true, active);
+        outputMeter.endBlock(true, false);
+    }
+    ToneMatchRun run;
+    for (const auto band : churchstream::ToneMatch::controlBand)
+    {
+        const auto target = churchstream::ToneMatch::targetDb[static_cast<size_t>(band)];
+        run.inputError += std::abs(target - inputMeter.getMeasuredDb(band));
+        run.outputError += std::abs(target - outputMeter.getMeasuredDb(band));
+    }
+    run.gains = match.getGainsDb();
+    return run;
+}
+
+CSP_TEST_CASE void testToneMatchOpensADullProgrammeAndTamesABrightOne()
+{
+    // Two recorded services were 4-10 dB short of the target in the air band.
+    // The Smart Engine cannot fix that: its baseline learns the church's own
+    // dullness as normal. ToneMatch compares against a fixed curve.
+    uint32_t seed = 0x2468aceu;
+    const auto white = [&seed] {
+        seed = seed * 1664525u + 1013904223u;
+        return 0.2f * (static_cast<float>(seed >> 8) / 8388608.0f - 1.0f);
+    };
+
+    // Dull: white noise through two one-pole low-passes at about 2.5 kHz.
+    float stageOne = 0.0f, stageTwo = 0.0f;
+    const auto dull = [&] {
+        constexpr float coefficient = 0.28f;
+        stageOne += coefficient * (white() - stageOne);
+        stageTwo += coefficient * (stageOne - stageTwo);
+        return 2.0f * stageTwo;
+    };
+    churchstream::ToneMatch opening;
+    opening.prepare(48000.0);
+    const auto opened = runToneMatch(opening, 90.0, true, dull);
+    expect(opened.gains[4] > 2.0f, "ToneMatch must lift the air band of a dull programme");
+    expect(opened.outputError < opened.inputError * 0.6f,
+           "ToneMatch must bring a dull programme measurably closer to the target curve");
+
+    // Bright: plain white noise is far above the curve at the top.
+    churchstream::ToneMatch taming;
+    taming.prepare(48000.0);
+    const auto tamed = runToneMatch(taming, 90.0, true, white);
+    expect(tamed.gains[4] < -2.0f, "ToneMatch must cut the air band of a bright programme");
+    for (size_t control = 0; control < churchstream::ToneMatch::controlCount; ++control)
+        expect(tamed.gains[control] >= churchstream::ToneMatch::minimumGainDb[control] - 1.0e-4f
+                   && tamed.gains[control] <= churchstream::ToneMatch::maximumGainDb[control] + 1.0e-4f,
+               "ToneMatch gains must stay inside their limits however far the programme is from the target");
+
+    // MANUAL, or the operator turning it off: back to flat, gradually.
+    const auto released = runToneMatch(opening, 30.0, false, dull);
+    for (const auto gain : released.gains)
+        expect(std::abs(gain) < 0.05f, "an inactive ToneMatch must return every band to flat");
+}
+
+CSP_TEST_CASE void testSmartEngineJudgesTheMixWithoutToneMatch()
+{
+    // The Smart Engine must see the programme as it would be without ToneMatch,
+    // otherwise every lift ToneMatch makes reads as an excess for it to cut.
+    constexpr double sampleRate = 48000.0;
+    churchstream::SignalMetrics original;
+    std::array<double, 5> energy {};
+    double total = 0.0;
+    const std::array<float, churchstream::ToneMatch::controlCount> gains { 1.0f, -2.0f, 1.0f, 4.0f, 6.0f };
+    churchstream::SignalMetrics lifted;
+    std::array<double, 5> liftedEnergy {};
+    double liftedTotal = 0.0;
+    for (int bin = 0; bin < churchstream::spectrumBins; ++bin)
+    {
+        const auto frequency = static_cast<double>(bin) * sampleRate / churchstream::fftSize;
+        // A gently falling programme spectrum.
+        const auto levelDb = static_cast<float>(-30.0 - 4.0 * std::log2(std::max(frequency, 50.0) / 1000.0));
+        const auto liftDb = bin > 0
+            ? churchstream::ToneMatch::responseDb(gains, sampleRate, static_cast<float>(frequency)) : 0.0f;
+        original.spectrumDb[static_cast<size_t>(bin)] = levelDb;
+        lifted.spectrumDb[static_cast<size_t>(bin)] = levelDb + liftDb;
+        const auto band = frequency < 120.0 ? 0 : frequency < 500.0 ? 1 : frequency < 2500.0 ? 2
+            : frequency < 8000.0 ? 3 : 4;
+        const auto power = std::pow(10.0, levelDb / 10.0);
+        const auto liftedPower = std::pow(10.0, (levelDb + liftDb) / 10.0);
+        if (bin > 0)
+        {
+            energy[static_cast<size_t>(band)] += power;
+            liftedEnergy[static_cast<size_t>(band)] += liftedPower;
+            total += power;
+            liftedTotal += liftedPower;
+        }
+    }
+    for (size_t band = 0; band < 5; ++band)
+    {
+        original.bandEnergy[band] = static_cast<float>(energy[band] / total);
+        original.bandLevelDb[band] = static_cast<float>(10.0 * std::log10(energy[band]));
+        lifted.bandEnergy[band] = static_cast<float>(liftedEnergy[band] / liftedTotal);
+        lifted.bandLevelDb[band] = static_cast<float>(10.0 * std::log10(liftedEnergy[band]));
+    }
+
+    expect(lifted.bandEnergy[4] > original.bandEnergy[4] * 1.5f,
+           "the fixture must actually lift the top band, otherwise it proves nothing");
+    const auto recovered = churchstream::SmartEngine::withoutToneMatch(lifted, sampleRate, gains);
+    for (size_t band = 0; band < 5; ++band)
+    {
+        expect(std::abs(recovered.bandEnergy[band] - original.bandEnergy[band]) < 0.005f,
+               "the Smart Engine must judge band shares as they were before ToneMatch");
+        expect(std::abs(recovered.bandLevelDb[band] - original.bandLevelDb[band]) < 0.1f,
+               "the Smart Engine must judge band levels as they were before ToneMatch");
+    }
+}
+
+CSP_TEST_CASE void testMonoSpreadWidensWithoutTouchingTheMonoSum()
+{
+    // Both recorded services reached the stream as mono. The spread must open
+    // the image on a stereo pair and leave a phone speaker hearing exactly the
+    // same programme; and it must leave a real stereo source alone.
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 256;
+    const auto render = [&](bool spread, bool stereoSource, std::vector<float>& monoSum, float& correlation,
+                            float& weight) {
+        auto engine = std::make_unique<churchstream::ProcessingEngine>();
+        engine->prepare(sampleRate, blockSize, 2);
+        configureDefaultChain(*engine);
+        engine->getParameters().monoSpreadEnabled.store(spread);
+        uint32_t seedLeft = 0x13579bdu, seedRight = 0x2468aceu;
+        const auto noise = [](uint32_t& seed) {
+            seed = seed * 1664525u + 1013904223u;
+            return 0.1f * (static_cast<float>(seed >> 8) / 8388608.0f - 1.0f);
+        };
+        std::vector<float> left(blockSize), right(blockSize);
+        float* channels[] { left.data(), right.data() };
+        const auto blocks = static_cast<int>(12.0 * sampleRate / blockSize);
+        const auto measuredFrom = blocks - static_cast<int>(4.0 * sampleRate / blockSize);
+        double lr = 0.0, ll = 0.0, rr = 0.0;
+        monoSum.clear();
+        for (int block = 0; block < blocks; ++block)
+        {
+            for (int sample = 0; sample < blockSize; ++sample)
+            {
+                const auto value = noise(seedLeft);
+                left[static_cast<size_t>(sample)] = value;
+                right[static_cast<size_t>(sample)] = stereoSource ? noise(seedRight) : value;
+            }
+            engine->process(channels, 2, blockSize);
+            if (block < measuredFrom)
+                continue;
+            for (int sample = 0; sample < blockSize; ++sample)
+            {
+                const auto l = static_cast<double>(left[static_cast<size_t>(sample)]);
+                const auto r = static_cast<double>(right[static_cast<size_t>(sample)]);
+                lr += l * r;
+                ll += l * l;
+                rr += r * r;
+                monoSum.push_back(static_cast<float>(0.5 * (l + r)));
+            }
+        }
+        correlation = static_cast<float>(lr / std::sqrt(std::max(ll * rr, 1.0e-30)));
+        weight = engine->getMetrics().monoSpreadWeight.load();
+    };
+
+    std::vector<float> spreadSum, plainSum, stereoSum;
+    float spreadCorrelation = 0.0f, plainCorrelation = 0.0f, stereoCorrelation = 0.0f;
+    float spreadWeight = 0.0f, plainWeight = 0.0f, stereoWeight = 0.0f;
+    render(true, false, spreadSum, spreadCorrelation, spreadWeight);
+    render(false, false, plainSum, plainCorrelation, plainWeight);
+    render(true, true, stereoSum, stereoCorrelation, stereoWeight);
+
+    expect(spreadWeight > 0.95f, "a mono feed must be recognised as mono and spread");
+    expect(spreadCorrelation < 0.97f && spreadCorrelation > 0.6f,
+           "the spread must decorrelate the channels audibly but stay well clear of the phase safety");
+    expect(plainCorrelation > 0.999f, "without the spread a mono feed stays mono");
+
+    double cross = 0.0, spreadSquares = 0.0, plainSquares = 0.0;
+    for (size_t index = 0; index < std::min(spreadSum.size(), plainSum.size()); ++index)
+    {
+        cross += static_cast<double>(spreadSum[index]) * plainSum[index];
+        spreadSquares += static_cast<double>(spreadSum[index]) * spreadSum[index];
+        plainSquares += static_cast<double>(plainSum[index]) * plainSum[index];
+    }
+    const auto sumCorrelation = cross / std::sqrt(std::max(spreadSquares * plainSquares, 1.0e-30));
+    const auto sumLevelDb = 10.0 * std::log10(std::max(spreadSquares, 1.0e-30) / std::max(plainSquares, 1.0e-30));
+    // Not bit identical: the leveller and limiter see the stereo pair, whose
+    // power the spread raises by about 0.2 dB, and correct for it.
+    expect(sumCorrelation > 0.999, "the mono sum of a spread feed must be the same programme");
+    expect(std::abs(sumLevelDb) < 0.5, "the mono sum of a spread feed must keep its level");
+    expect(stereoWeight < 0.05f, "a real stereo source must not be spread");
+}
+
+CSP_TEST_CASE void testDefaultChainMeetsStreamingLoudness()
+{
+    // What the stream is held to: -14 LUFS integrated, the level YouTube and
+    // most platforms normalise to, and true peak at or under -1 dBTP so lossy
+    // encoding does not clip. Measured with libebur128 on the default chain,
+    // ToneMatch included, across worship followed by a sermon.
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 256;
+    auto engine = std::make_unique<churchstream::ProcessingEngine>();
+    engine->prepare(sampleRate, blockSize, 2);
+    configureDefaultChain(*engine);
+    auto* meter = ebur128_init(2, static_cast<unsigned long>(sampleRate), EBUR128_MODE_I | EBUR128_MODE_TRUE_PEAK);
+    std::vector<float> left(blockSize), right(blockSize), interleaved(2 * blockSize);
+    float* channels[] { left.data(), right.data() };
+    const auto run = [&](double seconds, double settleSeconds, const std::function<float(int64_t)>& generate) {
+        const auto blocks = static_cast<int>(seconds * sampleRate / blockSize);
+        const auto settle = static_cast<int>(settleSeconds * sampleRate / blockSize);
+        int64_t index = 0;
+        for (int block = 0; block < blocks; ++block)
+        {
+            for (int sample = 0; sample < blockSize; ++sample)
+            {
+                const auto value = generate(index++);
+                left[static_cast<size_t>(sample)] = value;
+                right[static_cast<size_t>(sample)] = value;
+            }
+            engine->process(channels, 2, blockSize);
+            if (block < settle)
+                continue;
+            for (int sample = 0; sample < blockSize; ++sample)
+            {
+                interleaved[static_cast<size_t>(2 * sample)] = left[static_cast<size_t>(sample)];
+                interleaved[static_cast<size_t>(2 * sample + 1)] = right[static_cast<size_t>(sample)];
+            }
+            ebur128_add_frames_float(meter, interleaved.data(), static_cast<size_t>(blockSize));
+        }
+    };
+    run(40.0, 10.0, [&](int64_t index) { return worshipSample(index, sampleRate, 0.08f); });
+    run(50.0, 15.0, [&](int64_t index) { return sermonSample(index, sampleRate, 0.03f); });
+    double integrated = -100.0, peakLeft = 0.0, peakRight = 0.0;
+    ebur128_loudness_global(meter, &integrated);
+    ebur128_true_peak(meter, 0, &peakLeft);
+    ebur128_true_peak(meter, 1, &peakRight);
+    ebur128_destroy(&meter);
+    const auto truePeakDb = 20.0 * std::log10(std::max({ peakLeft, peakRight, 1.0e-9 }));
+    expect(std::abs(integrated + 14.0) < 1.0, "the default chain must deliver -14 LUFS integrated within 1 LU");
+    expect(truePeakDb <= -0.95, "the default chain must hold true peak at or under -1 dBTP");
+}
+
 bool writeWav(const juce::File& target, const juce::AudioBuffer<float>& buffer, double sampleRate)
 {
     juce::WavAudioFormat format;
@@ -3258,6 +3671,12 @@ int main()
     testTransientDensityKeepsRespondingAfterALongService();
     testSpectrumIsAveragedNotASingleWindow();
     testKWeightedLevelerIgnoresSubBassWeighting();
+    testSermonAndWorshipLandAtTheSameLoudness();
+    testCompressorWorksWhateverTheConsoleSends();
+    testToneMatchOpensADullProgrammeAndTamesABrightOne();
+    testSmartEngineJudgesTheMixWithoutToneMatch();
+    testMonoSpreadWidensWithoutTouchingTheMonoSum();
+    testDefaultChainMeetsStreamingLoudness();
     testReferenceProfileCaptureAndJsonRoundTrip();
     testReferenceComparisonIsLoudnessNormalised();
     testReferenceMatchEnginePublishesComparison();

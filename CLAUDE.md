@@ -17,6 +17,15 @@ cmake --build build-dev -j8 --target ChurchStreamProcessorTests
 ./build-dev/ChurchStreamProcessorTests_artefacts/Debug/ChurchStreamProcessorTests
 ```
 
+La suite en Debug tarda ~2 min; en Release (`build-render`, ver abajo) ~23 s.
+Para el ciclo normal de cambios usá Release; Debug sólo para depurar con
+aserciones de JUCE:
+
+```bash
+cmake --build build-render -j8 --target ChurchStreamProcessorTests
+./build-render/ChurchStreamProcessorTests_artefacts/Release/ChurchStreamProcessorTests
+```
+
 Los flags `FETCHCONTENT_SOURCE_DIR_*` reutilizan las fuentes de JUCE/libebur128
 ya clonadas en `build-release/_deps` en vez de volver a clonarlas — sin eso,
 un `build-dev` nuevo tarda varios minutos sólo en `git clone`.
@@ -31,6 +40,20 @@ cmake --build build-dev -j8 --target ChurchStreamProcessorBenchmark
 Para probar la cadena de audio contra un WAV real (sin dispositivo, sin GUI),
 usá `OfflineProcessor` — es el mismo camino que usa el botón "Offline Test"
 de la app, pero es invocable como test.
+
+Para juzgar cambios de dinámica/leveller sobre un servicio grabado completo,
+`ChurchStreamProcessorRender` pasa un WAV por el `ProcessingEngine` real con
+los valores por defecto de la app y escribe al lado una traza por segundo
+(`<salida>.csv`: ganancia del leveller, nivel, gate, compresor, limitador).
+Compilalo en Release (un servicio de 2 h tarda ~1 min; en Debug, mucho más):
+
+```bash
+cmake -S . -B build-render -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release \
+  -DFETCHCONTENT_SOURCE_DIR_JUCE="$PWD/build-release/_deps/juce-src" \
+  -DFETCHCONTENT_SOURCE_DIR_LIBEBUR128="$PWD/build-release/_deps/libebur128-src"
+cmake --build build-render -j8 --target ChurchStreamProcessorRender
+./build-render/ChurchStreamProcessorRender_artefacts/Release/ChurchStreamProcessorRender culto.wav culto-procesado.wav
+```
 
 ## Cuándo sí hace falta lanzar la app
 

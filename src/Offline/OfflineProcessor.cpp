@@ -47,6 +47,12 @@ bool OfflineProcessor::startProcessing(const juce::File& source, const DspParame
     parameterCopy.compressor = parameters.compressorEnabled.load();
     parameterCopy.saturation = parameters.saturationEnabled.load();
     parameterCopy.limiter = parameters.limiterEnabled.load();
+    parameterCopy.dynamicEq = parameters.dynamicEqEnabled.load();
+    parameterCopy.deEsser = parameters.deEsserEnabled.load();
+    parameterCopy.leveller = parameters.broadcastLevelerEnabled.load();
+    parameterCopy.toneMatch = parameters.toneMatchEnabled.load();
+    parameterCopy.monoCompatibility = parameters.monoCompatibilityEnabled.load();
+    parameterCopy.phaseCoherence = parameters.phaseCoherenceEnabled.load();
     {
         const juce::ScopedLock lock(resultLock);
         result = {};
@@ -113,6 +119,12 @@ void OfflineProcessor::run()
     parameters.compressorEnabled.store(parameterCopy.compressor);
     parameters.saturationEnabled.store(parameterCopy.saturation);
     parameters.limiterEnabled.store(parameterCopy.limiter);
+    parameters.dynamicEqEnabled.store(parameterCopy.dynamicEq);
+    parameters.deEsserEnabled.store(parameterCopy.deEsser);
+    parameters.broadcastLevelerEnabled.store(parameterCopy.leveller);
+    parameters.toneMatchEnabled.store(parameterCopy.toneMatch);
+    parameters.monoCompatibilityEnabled.store(parameterCopy.monoCompatibility);
+    parameters.phaseCoherenceEnabled.store(parameterCopy.phaseCoherence);
 
     auto analysisPointer = std::make_unique<AnalysisEngine>();
     auto& analysis = *analysisPointer;

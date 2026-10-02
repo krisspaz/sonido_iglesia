@@ -4,6 +4,9 @@
 #include "DspParameters.h"
 #include "DynamicBand.h"
 #include "KWeighting.h"
+#include "MonoSpread.h"
+#include "ProgrammeLevelTracker.h"
+#include "ToneMatch.h"
 #include "TruePeakDetector.h"
 
 #include <array>
@@ -93,6 +96,7 @@ private:
     // stream: handling noise, air conditioning and stage thump all sit between
     // 40 and 90 Hz, where 12 dB/octave is not enough to matter.
     std::array<Biquad, 2> rumbleFilters;
+    ToneMatch toneMatch;
     Biquad warmthFilter;
     Biquad lowFilter;
     Biquad mudFilter;
@@ -121,6 +125,7 @@ private:
     // Side has to be gone before a phone speaker cancels it, while the high
     // Side keeps its presence untouched.
     std::array<Biquad, 4> sideBassFilters;
+    MonoSpread monoSpread;
 
     juce::dsp::LinkwitzRileyFilter<float> middleSplit;
     juce::dsp::LinkwitzRileyFilter<float> lowSplit;
@@ -175,79 +180,33 @@ private:
     // tonal shaping hiding inside something named after a safety measure, and
     // it moved with the sample rate.
     float dcBlockerCoefficient = 0.9993f;
-    KWeighting levelerWeighting;
     float lastCompressorReduction = 0.0f;
     float lastLimiterReduction = 0.0f;
-    // The leveler measures programme RMS after EQ/compression but before the
-    // true-peak limiter. It deliberately uses seconds-long time constants so
-    // phrases stay natural and pauses do not turn into amplified room noise.
-    float programmeLevelSquare = 0.0f;
-    float programmeLevelGain = 1.0f;
-
-    // One-dimensional Kalman estimate of programme level in dB. The point is
-    // not the maths but the adaptive gain: while the level is stable the
-    // covariance collapses and the estimate barely moves, which is what stops a
-    // compressor from breathing between phrases. When the innovation stays
-    // large -- worship ending, a pastor starting to pray -- the process noise
-    // is raised and the same filter turns into a fast one for as long as the
-    // section change lasts.
-    float programmeLevelEstimateDb = -100.0f;
-    float programmeLevelCovariance = 400.0f;
-    float programmeInnovationAverage = 0.0f;
-    bool programmeLevelInitialised = false;
-    // Gating with the shape of BS.1770 (absolute floor plus a relative gate
-    // below the running programme level) applied to the leveler's RMS detector.
-    // It is not a conformant loudness measurement -- there is no K-weighting
-    // and no 400 ms blocks -- it is the same gating idea used to stop pauses
-    // from being levelled up into air-conditioning noise.
-    float programmeLoudnessAverage = -100.0f;
-    // Counts gated samples so the running average starts as a true cumulative
-    // mean and only then degrades into a 30 s window. A plain exponential
-    // average needs minutes to become meaningful, and until it does the
-    // relative gate sits far too low to exclude anything.
-    float loudnessSampleCount = 0.0f;
-    // A pause and a quieter section look identical to the relative gate: both
-    // drop below it. What separates them is how long they last. Anything
-    // shorter than the hold is treated as a pause and frozen through; anything
-    // longer is accepted as the new programme, and the reference the gate is
-    // relative to is rebased onto it so the leveler can track it.
-    float gateClosedSamples = 0.0f;
-    float gateHoldSamples = 0.0f;
-    // Counts down after the gate accepts a new section, and is the only thing
-    // that lets the estimate accelerate downwards. Speeding up on any fall
-    // means a pause is chased for as long as the gate takes to classify it,
-    // and that fall is exactly the room tone nobody wants amplified.
-    float sectionRebaseSamples = 0.0f;
-    float sectionRebaseLength = 0.0f;
-    // Duration alone cannot separate a quieter section from room tone: four
-    // seconds of air conditioning outlasts any sensible hold. What separates
-    // them is that speech moves and a room does not. This tracks how much the
-    // measured level varies around its own short-term trend, which is several
-    // dB for anything anyone is saying and close to zero for a fan.
-    // The level the gate decides on, integrated over roughly the 400 ms block
-    // BS.1770 gates on. The Kalman still measures the fast 50 ms detector: a
-    // gate driven by that detector opens and closes on every syllable, and
-    // each closure freezes the estimate for a few milliseconds, which between
-    // them halve how fast a section change can be tracked.
-    float gateLevelDb = -100.0f;
-    float gateLevelCoefficient = 0.0f;
-    float programmeLevelTrend = -100.0f;
-    float levelVariationDb = 0.0f;
-    float levelTrendCoefficient = 0.0f;
-    bool levelerGateOpen = false;
-    // A closed gate freezes the leveler, which is right for a prayer pause but
-    // wrong for the end of a service: holding +15 dB armed means the next thing
-    // through the microphone gets amplified. Real silence, below the absolute
-    // gate rather than merely below the relative one, therefore slides the
-    // estimate back towards the target so the gain returns to unity.
-    float silenceSamples = 0.0f;
-    float silenceReleaseSamples = 0.0f;
-    float silenceReleaseGain = 0.0f;
-    float kalmanSteadyGain = 0.0f;
-    float kalmanFastGain = 0.0f;
-    float innovationCoefficient = 0.0f;
-    float loudnessAverageCoefficient = 0.0f;
-    float levelDetectorCoefficient = 0.0f;
+    // Broadcast leveller, split around the compressor the way a broadcast
+    // processor is. The gated, K-weighted estimate is taken on the programme
+    // entering the crossover, and the part of the leveller gain that brings it
+    // to a fixed working level is applied there (`inputLevelGain`), so the
+    // compressor always works on the same programme level whatever the console
+    // sends. The rest -- working level to the operator's target, plus the
+    // loudness the compression itself took away -- is applied after it
+    // (`outputLevelGain`). Measuring after the compressor instead, as this used
+    // to, left the compressor judging raw console level against fixed
+    // thresholds: on a -35 dBFS feed it never engaged at all.
+    ProgrammeLevelTracker levelTracker;
+    float levelTotalDb = 0.0f;
+    float levelInputDb = 0.0f;
+    float inputLevelGain = 1.0f;
+    float outputLevelGain = 1.0f;
+    // Loudness the compressor removed, as a ratio of K-weighted power entering
+    // the crossover to power leaving the wet path. A ratio of two averages over
+    // the same span, so it follows what the compressor did and not how the
+    // programme moved; integrated only while the gate is open.
+    KWeighting compressionOutputWeighting;
+    float compressionInputSquare = 0.0f;
+    float compressionOutputSquare = 0.0f;
+    float compressionAverageCoefficient = 0.0f;
+    float compensationDb = 0.0f;
+    float compensationSmoothing = 0.0f;
     double dryLoudnessSquare = 0.0;
     double wetLoudnessSquare = 0.0;
     float loudnessMatchCoefficient = 0.0f;
