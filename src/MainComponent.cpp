@@ -141,18 +141,20 @@ MainComponent::MainComponent(bool startAudio)
     addAndMakeVisible(savePresetButton);
     refreshUserPresets();
 
-    const std::array<juce::String, 6> controlNames { "CLEAN", "PUNCH", "CLARITY", "DYNAMICS", "WARMTH", "LOUDNESS TARGET" };
-    std::array<juce::Slider*, 6> sliders { &cleanSlider, &punchSlider, &claritySlider,
-                                           &dynamicsSlider, &warmthSlider, &loudnessSlider };
+    const std::array<juce::String, 7> controlNames { "CLEAN", "PUNCH", "CLARITY", "DYNAMICS", "WARMTH", "BODY", "LOUDNESS TARGET" };
+    std::array<juce::Slider*, 7> sliders { &cleanSlider, &punchSlider, &claritySlider,
+                                           &dynamicsSlider, &warmthSlider, &bodySlider, &loudnessSlider };
     for (size_t index = 0; index < sliders.size(); ++index)
     {
         configureHeading(controlLabels[index], 9.5f, Colours::mutedText);
         controlLabels[index].setText(controlNames[index], juce::dontSendNotification);
         addAndMakeVisible(controlLabels[index]);
-        configureControlSlider(*sliders[index], index == 5 ? " LUFS" : " %");
+        configureControlSlider(*sliders[index], sliders[index] == &loudnessSlider ? " LUFS" : " %");
         addAndMakeVisible(*sliders[index]);
     }
     loudnessSlider.setRange(-18.0, -10.0, 0.1);
+    bodySlider.setTooltip("Fills in thin worship: parallel compression on the low mids. "
+                          "Fades out by itself on speech while Smart Processing is on.");
     for (auto* button : { &autoTuneButton, &abButton, &bypassButton }) addAndMakeVisible(*button);
     bypassButton.setColour(juce::TextButton::buttonColourId, Colours::danger.withAlpha(0.85f));
     abButton.setClickingTogglesState(true);
@@ -526,8 +528,8 @@ void MainComponent::resized()
         smartHeader.removeFromRight(6);
         presetSelector.setBounds(smartHeader);
         smart.removeFromTop(8);
-        std::array<juce::Slider*, 6> sliders { &cleanSlider, &punchSlider, &claritySlider,
-                                               &dynamicsSlider, &warmthSlider, &loudnessSlider };
+        std::array<juce::Slider*, 7> sliders { &cleanSlider, &punchSlider, &claritySlider,
+                                               &dynamicsSlider, &warmthSlider, &bodySlider, &loudnessSlider };
         for (size_t i = 0; i < sliders.size(); ++i)
         {
             auto row = smart.removeFromTop(34);
@@ -1086,6 +1088,11 @@ void MainComponent::updateLiveValues()
         actions += juce::String(actions.isEmpty() ? "" : "\n") + "BROADCAST LEVEL | "
             + juce::String(programmeGainDb >= 0.0f ? "+" : "")
             + juce::String(programmeGainDb, 1) + " dB toward stream target";
+    const auto bodyMix = dspMetrics.bodyMix.load(std::memory_order_acquire);
+    if (bodySlider.getValue() > 0.0)
+        actions += juce::String(actions.isEmpty() ? "" : "\n") + "BODY | "
+            + (bodyMix >= 0.05f ? juce::String(static_cast<int>(bodyMix * 100.0f)) + "% on music"
+                                : juce::String("standing down (speech)"));
 
     actionsLabel.setText(actions.trimEnd(), juce::dontSendNotification);
     if (smart.autoTuneState == AutoTuneState::analysing)
@@ -1131,6 +1138,7 @@ void MainComponent::updateDspControls()
     claritySlider.setValue(settings.getNumber("clarity", 50.0), juce::dontSendNotification);
     dynamicsSlider.setValue(settings.getNumber("dynamics", 50.0), juce::dontSendNotification);
     warmthSlider.setValue(settings.getNumber("warmth", 35.0), juce::dontSendNotification);
+    bodySlider.setValue(settings.getNumber("body", 50.0), juce::dontSendNotification);
     loudnessSlider.setValue(settings.getNumber("loudnessTarget", -14.0), juce::dontSendNotification);
     smartProcessing.setToggleState(settings.getNumber("smartProcessing", 1.0) > 0.5, juce::dontSendNotification);
     operatingMode.setSelectedItemIndex(static_cast<int>(settings.getNumber("operatingMode", 1.0)), juce::dontSendNotification);
@@ -1153,6 +1161,7 @@ void MainComponent::updateDspControls()
     update(claritySlider, parameters.clarity, "clarity", 0.01f);
     update(dynamicsSlider, parameters.dynamics, "dynamics", 0.01f);
     update(warmthSlider, parameters.warmth, "warmth", 0.01f);
+    update(bodySlider, parameters.body, "body", 0.01f);
     update(loudnessSlider, parameters.loudnessTarget, "loudnessTarget", 1.0f);
     smartProcessing.onClick = [this, &parameters]
     {
@@ -1202,6 +1211,7 @@ void MainComponent::updateDspControls()
         claritySlider.setValue(loadedParameters.clarity.load() * 100.0f, juce::dontSendNotification);
         dynamicsSlider.setValue(loadedParameters.dynamics.load() * 100.0f, juce::dontSendNotification);
         warmthSlider.setValue(loadedParameters.warmth.load() * 100.0f, juce::dontSendNotification);
+        bodySlider.setValue(loadedParameters.body.load() * 100.0f, juce::dontSendNotification);
         loudnessSlider.setValue(loadedParameters.loudnessTarget.load(), juce::dontSendNotification);
         smartProcessing.setToggleState(loadedParameters.smartProcessing.load(), juce::dontSendNotification);
         operatingMode.setSelectedItemIndex(loadedParameters.operatingMode.load(), juce::dontSendNotification);
@@ -1231,6 +1241,7 @@ void MainComponent::updateDspControls()
             { &claritySlider,  &parameters.clarity,        "clarity",        50.0, 0.01f },
             { &dynamicsSlider, &parameters.dynamics,       "dynamics",       50.0, 0.01f },
             { &warmthSlider,   &parameters.warmth,         "warmth",         35.0, 0.01f },
+            { &bodySlider,     &parameters.body,           "body",           50.0, 0.01f },
             { &loudnessSlider, &parameters.loudnessTarget, "loudnessTarget", -14.0, 1.0f },
         };
         suppressDspCallbacks = true;
@@ -1327,17 +1338,18 @@ void MainComponent::applyRefreshRate()
 
 void MainComponent::applyBuiltInPreset(int presetIndex)
 {
-    struct Values { double clean, punch, clarity, dynamics, warmth, loudness; int mode; };
+    struct Values { double clean, punch, clarity, dynamics, warmth, body, loudness; int mode; };
     const std::array<Values, 7> values {{
-        { 55, 60, 62, 52, 35, -14.0, 1 }, { 50, 66, 58, 48, 52, -14.0, 1 },
-        { 35, 62, 58, 35, 45, -15.0, 1 }, { 58, 70, 60, 62, 38, -14.0, 1 },
-        { 48, 42, 72, 55, 30, -14.0, 1 }, { 72, 45, 68, 48, 20, -15.0, 1 },
-        { 50, 50, 50, 50, 35, -14.0, 2 }
+        { 55, 60, 62, 52, 35, 50, -14.0, 1 }, { 50, 66, 58, 48, 52, 65, -14.0, 1 },
+        { 35, 62, 58, 35, 45, 40, -15.0, 1 }, { 58, 70, 60, 62, 38, 60, -14.0, 1 },
+        { 48, 42, 72, 55, 30, 45, -14.0, 1 }, { 72, 45, 68, 48, 20, 25, -15.0, 1 },
+        { 50, 50, 50, 50, 35,  0, -14.0, 2 }
     }};
     if (!juce::isPositiveAndBelow(presetIndex, static_cast<int>(values.size()))) return;
     const auto& preset = values[static_cast<size_t>(presetIndex)];
     cleanSlider.setValue(preset.clean); punchSlider.setValue(preset.punch); claritySlider.setValue(preset.clarity);
-    dynamicsSlider.setValue(preset.dynamics); warmthSlider.setValue(preset.warmth); loudnessSlider.setValue(preset.loudness);
+    dynamicsSlider.setValue(preset.dynamics); warmthSlider.setValue(preset.warmth); bodySlider.setValue(preset.body);
+    loudnessSlider.setValue(preset.loudness);
     operatingMode.setSelectedItemIndex(preset.mode);
 }
 
@@ -1401,6 +1413,7 @@ void MainComponent::applySectionVisibility()
     claritySlider.setVisible(dsp);
     dynamicsSlider.setVisible(dsp);
     warmthSlider.setVisible(dsp);
+    bodySlider.setVisible(dsp);
     loudnessSlider.setVisible(dsp);
     autoTuneButton.setVisible(dsp);
     abButton.setVisible(dsp);

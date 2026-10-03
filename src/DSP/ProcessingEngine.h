@@ -160,6 +160,14 @@ private:
     // runs on the uncompressed band, so this cannot form a loop.
     std::array<float, 4> bandAverageGain { 1.0f, 1.0f, 1.0f, 1.0f };
     float makeupCoefficient = 0.0f;
+    // BODY: a heavily compressed copy of the recombined programme, shaped
+    // towards the low mids and added back underneath it. Quiet passages and
+    // the sustain of every note come up, peaks barely move, which is what
+    // fills in a worship mix that sounds empty at the same loudness.
+    std::array<Biquad, 2> bodyFilters;
+    float bodyEnvelopeSquare = 0.0f;
+    float bodyGain = 1.0f;
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> bodyMix;
     float limiterGain = 1.0f;
     // Sliding minimum of the limiter gain across the lookahead window, then
     // smoothed. Applying the instantaneous gain to the delayed sample was a

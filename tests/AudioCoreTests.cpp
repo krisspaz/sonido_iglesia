@@ -2735,6 +2735,48 @@ CSP_TEST_CASE void testCompressorMakeupKeepsLevel()
     expect(differenceDb < 1.5f, "compressor makeup must not overshoot into a level boost");
 }
 
+CSP_TEST_CASE void testBodyFillsQuietMusicAndStandsDownOnSpeech()
+{
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 256;
+    const auto pi = juce::MathConstants<double>::pi;
+
+    // BODY is measured in isolation: everything else that moves level is off,
+    // so any difference between the two renders is the parallel bus.
+    const auto liftDb = [&](float amplitude, float body, float musicWeight) {
+        const auto tone = [pi, amplitude](int64_t index) {
+            return static_cast<float>(amplitude * std::sin(2.0 * pi * 220.0 * static_cast<double>(index) / sampleRate));
+        };
+        const auto render = [&](float amount) {
+            auto engine = std::make_unique<churchstream::ProcessingEngine>();
+            engine->prepare(sampleRate, blockSize, 2);
+            auto& p = engine->getParameters();
+            p.smartProcessing.store(false);
+            p.rumbleEnabled.store(false);
+            p.adaptiveEqEnabled.store(false);
+            p.toneMatchEnabled.store(false);
+            p.compressorEnabled.store(false);
+            p.saturationEnabled.store(false);
+            p.limiterEnabled.store(false);
+            p.broadcastLevelerEnabled.store(false);
+            p.monoSpreadEnabled.store(false);
+            p.body.store(amount);
+            engine->getAdaptiveTargets().musicWeight.store(musicWeight);
+            return renderSignalRms(*engine, blockSize, sampleRate, 4.0, 1.0, tone);
+        };
+        return 20.0f * std::log10(std::max(render(body), 1.0e-12f) / std::max(render(0.0f), 1.0e-12f));
+    };
+
+    const auto quiet = liftDb(0.01f, 1.0f, 1.0f);
+    const auto loud = liftDb(0.30f, 1.0f, 1.0f);
+    expect(quiet > 4.0f, "BODY must fill in a quiet passage of music");
+    expect(loud < 1.5f, "BODY must barely move a passage that is already loud");
+    expect(quiet - loud > 3.0f, "BODY must lift quiet music more than loud music, or it is just a boost");
+    expect(std::abs(liftDb(0.01f, 1.0f, 0.0f)) < 0.1f, "BODY must stand down completely on speech");
+    expect(std::abs(liftDb(0.0003f, 1.0f, 1.0f)) < 0.5f, "BODY must not lift room tone in a pause");
+    expect(std::abs(liftDb(0.01f, 0.0f, 1.0f)) < 1.0e-3f, "BODY at zero must leave the programme untouched");
+}
+
 CSP_TEST_CASE void testLevelerFollowsTheOperatorLoudnessTarget()
 {
     constexpr double sampleRate = 48000.0;
@@ -3090,6 +3132,57 @@ CSP_TEST_CASE void testSermonAndWorshipLandAtTheSameLoudness()
     expect(std::abs(worship + 14.0f) < 1.5f, "worship must be levelled to the operator's loudness target");
     expect(std::abs(sermon - worship) < 1.5f,
            "a sermon well below the worship must come out at the same loudness, neither under nor over it");
+}
+
+CSP_TEST_CASE void testSermonIsAudibleAsSoonAsWorshipEnds()
+{
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 256;
+    for (const auto sermonAmplitude : { 0.03f, 0.012f, 0.005f })
+    {
+        auto engine = std::make_unique<churchstream::ProcessingEngine>();
+        engine->prepare(sampleRate, blockSize, 2);
+        configureDefaultChain(*engine);
+        std::vector<float> left(blockSize), right(blockSize);
+        float* channels[] { left.data(), right.data() };
+        const auto coefficient = std::exp(-1.0 / (sampleRate * 0.4));
+        double outputSquare = 0.0;
+        int64_t index = 0;
+        const auto run = [&](double seconds, bool sermon, std::vector<float>* trace) {
+            const auto blocks = static_cast<int>(seconds * sampleRate / blockSize);
+            for (int block = 0; block < blocks; ++block)
+            {
+                for (int sample = 0; sample < blockSize; ++sample)
+                {
+                    const auto value = sermon ? sermonSample(index, sampleRate, sermonAmplitude)
+                                              : worshipSample(index, sampleRate, 0.08f);
+                    ++index;
+                    left[static_cast<size_t>(sample)] = value;
+                    right[static_cast<size_t>(sample)] = value;
+                }
+                engine->process(channels, 2, blockSize);
+                for (int sample = 0; sample < blockSize; ++sample)
+                    outputSquare = coefficient * outputSquare
+                        + (1.0 - coefficient) * left[static_cast<size_t>(sample)] * left[static_cast<size_t>(sample)];
+                if (trace != nullptr && block < 800 && block % 19 == 0)
+                    std::cout << (engine->getMetrics().levelerGateOpen.load() ? "o" : "c");
+                if (trace != nullptr && block % 94 == 0)
+                {
+                    trace->push_back(static_cast<float>(10.0 * std::log10(outputSquare + 1.0e-20)));
+                    std::cout << "[" << engine->getMetrics().broadcastLevelGainDb.load() << (engine->getMetrics().levelerGateOpen.load() ? "o" : "c") << "]";
+                }
+            }
+        };
+        run(30.0, false, nullptr);
+        std::cout << "worship gain " << engine->getMetrics().broadcastLevelGainDb.load() << "\n";
+        const auto worshipDb = 10.0 * std::log10(outputSquare);
+        std::vector<float> trace;
+        run(15.0, true, &trace);
+        std::cout << "sermon " << sermonAmplitude << " worship " << worshipDb << " dB:";
+        for (const auto value : trace)
+            std::cout << ' ' << std::lround(value - worshipDb);
+        std::cout << '\n';
+    }
 }
 
 CSP_TEST_CASE void testCompressorWorksWhateverTheConsoleSends()
@@ -3665,6 +3758,7 @@ int main()
     testObsWebSocketAuthenticationVector();
     testDeEsserActsOnSibilantsNotOnSteadyTone();
     testCompressorMakeupKeepsLevel();
+    testBodyFillsQuietMusicAndStandsDownOnSpeech();
     testLevelerFollowsTheOperatorLoudnessTarget();
     testSmartLoudnessGainDoesNotFightTheLeveler();
     testRumbleFilterIsFourthOrder();
@@ -3672,6 +3766,7 @@ int main()
     testSpectrumIsAveragedNotASingleWindow();
     testKWeightedLevelerIgnoresSubBassWeighting();
     testSermonAndWorshipLandAtTheSameLoudness();
+    testSermonIsAudibleAsSoonAsWorshipEnds();
     testCompressorWorksWhateverTheConsoleSends();
     testToneMatchOpensADullProgrammeAndTamesABrightOne();
     testSmartEngineJudgesTheMixWithoutToneMatch();

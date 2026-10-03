@@ -228,6 +228,22 @@ void SmartEngine::update(const AnalysisSnapshot& rawSnapshot, float elapsedSecon
         processing.getAdaptiveTargets().stereoBalanceDb.store(0.0f, std::memory_order_release);
     }
 
+    // BODY belongs on the worship, not on the sermon. Slow both ways so a
+    // spoken line inside a song, or a pad under the preacher, cannot pump the
+    // parallel bus; silence holds the weight where it was. Without the Smart
+    // Engine the weight is 1 and BODY answers to the operator alone.
+    {
+        auto& musicWeight = processing.getAdaptiveTargets().musicWeight;
+        const auto current = musicWeight.load(std::memory_order_relaxed);
+        const auto spoken = next.context == MixContext::speech || next.context == MixContext::soloVocal;
+        auto target = spoken ? 0.0f : 1.0f;
+        if (!next.active)
+            target = 1.0f;
+        else if (next.context == MixContext::quiet || snapshot.processed.rmsDb <= -60.0f)
+            target = current;
+        musicWeight.store(smooth(current, target, elapsedSeconds, 4.0f, 3.0f), std::memory_order_release);
+    }
+
     next.baselineReady = baseline.ready;
     next.bandState = snapshot.processed.bandEnergy;
     next.rumbleState = spectrumEnergy(snapshot.processed, snapshot.sampleRate, 20.0f, 40.0f);

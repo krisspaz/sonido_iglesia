@@ -80,6 +80,27 @@ constexpr double compressorMakeupSeconds = 0.50;
 // the fast movement be controlled.
 constexpr float compressorMakeupAmount = 0.80f;
 
+// BODY, the parallel bus. Threshold sits well under the working level so the
+// bus is compressing nearly all the time: at full BODY a passage 12 dB under
+// the working level comes up by about 3.5 dB overall and 5.5 dB around 220 Hz,
+// while a loud chorus gains about 1 dB, which the limiter and the leveller
+// absorb. The shaping keeps what is added in the 150-500 Hz region a thin mix
+// is missing, and out of the presence range where it would only add harshness.
+// Below the floor the bus expands away instead, so it cannot lift room tone in
+// a pause the way a plain parallel compressor does.
+constexpr float bodyThresholdDb = levelerWorkingLevelDb - 12.0f;
+constexpr float bodyFloorDb = bodyThresholdDb - 18.0f;
+constexpr float bodyExpansionRatio = 2.0f;
+constexpr float bodyRatio = 6.0f;
+constexpr float bodyMaximumReductionDb = 40.0f;
+constexpr float bodyMaximumMix = 0.50f;
+constexpr float bodyCentreHz = 220.0f;
+constexpr float bodyCentreQ = 0.70f;
+constexpr float bodyCentreGainDb = 5.0f;
+constexpr float bodyLowPassHz = 4500.0f;
+constexpr double bodyAttackSeconds = 0.005;
+constexpr double bodyReleaseSeconds = 0.180;
+
 // Dynamic EQ. The two sustained bands are judged against the broadband
 // programme, the de-esser against its own running average. Offsets are in dB
 // relative to that reference and are starting points, not measurements: they
@@ -176,6 +197,12 @@ void ProcessingEngine::prepare(double newSampleRate, int maximumBlockSize, int c
                          &harshGain, &sibilanceGain, &highGain, &outputGain })
         value->reset(sampleRate, 0.75);
     configureDynamicBands();
+    bodyFilters[0].setPeak(sampleRate, bodyCentreHz, bodyCentreQ, bodyCentreGainDb);
+    bodyFilters[1].setLowPass(sampleRate, bodyLowPassHz);
+    // The music weight already ramps over seconds; this only keeps an operator
+    // moving the slider from zippering.
+    bodyMix.reset(sampleRate, 0.5);
+    bodyMix.setCurrentAndTargetValue(0.0f);
     broadbandReferenceCoefficient = std::exp(-1.0f / static_cast<float>(sampleRate * broadbandReferenceSeconds));
     makeupCoefficient = std::exp(-1.0f / static_cast<float>(sampleRate * compressorMakeupSeconds));
     // A true DC blocker: about 5 Hz, and derived from the sample rate rather
@@ -248,6 +275,10 @@ void ProcessingEngine::resetProcessingState() noexcept
     highFilter.reset();
     for (auto& filter : sideBassFilters)
         filter.reset();
+    for (auto& filter : bodyFilters)
+        filter.reset();
+    bodyEnvelopeSquare = 0.0f;
+    bodyGain = 1.0f;
     for (auto& band : dynamicBands)
         band.reset();
     broadbandReferenceSquare = 0.0f;
@@ -325,6 +356,8 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
     const auto punch = clampControl(parameters.punch.load(std::memory_order_relaxed));
     const auto dynamics = clampControl(parameters.dynamics.load(std::memory_order_relaxed));
     const auto warmth = clampControl(parameters.warmth.load(std::memory_order_relaxed));
+    const auto body = clampControl(parameters.body.load(std::memory_order_relaxed))
+        * std::clamp(adaptiveTargets.musicWeight.load(std::memory_order_relaxed), 0.0f, 1.0f);
     const auto eqEnabled = parameters.adaptiveEqEnabled.load(std::memory_order_relaxed);
     const auto rumbleIsEnabled = parameters.rumbleEnabled.load(std::memory_order_relaxed);
     const auto toneMatchIsActive = parameters.toneMatchEnabled.load(std::memory_order_relaxed)
@@ -410,6 +443,8 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
     const auto gainRelease = std::exp(-1.0f / static_cast<float>(sampleRate * 0.140));
     const auto saturationDrive = 1.0f + warmth * 0.16f;
     const auto saturationNormaliser = 1.0f / std::tanh(saturationDrive);
+    const auto bodyAttack = std::exp(-1.0f / static_cast<float>(sampleRate * bodyAttackSeconds));
+    const auto bodyRelease = std::exp(-1.0f / static_cast<float>(sampleRate * bodyReleaseSeconds));
     const auto limiterRelease = std::exp(-1.0f / static_cast<float>(sampleRate * 0.080));
     std::array<float, multibandLimiterBandCount> multibandLimiterAttack {};
     std::array<float, multibandLimiterBandCount> multibandLimiterRelease {};
@@ -432,6 +467,8 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
     const auto processedSelected = !parameters.bypass.load(std::memory_order_relaxed)
         && parameters.abProcessed.load(std::memory_order_relaxed);
     wetMix.setTargetValue(processedSelected ? 1.0f : 0.0f);
+    bodyMix.setTargetValue(body * bodyMaximumMix);
+    auto blockMaxBodyMix = 0.0f;
     const auto levelerActive = levelerIsEnabled && processedSelected;
 
     for (int sampleIndex = 0; sampleIndex < numSamples; ++sampleIndex)
@@ -651,6 +688,7 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
         }
 
         const auto blockOutputGain = outputGain.getNextValue();
+        float recombined[maximumChannels] { 0.0f, 0.0f };
         for (int channel = 0; channel < activeChannels; ++channel)
         {
             const auto compressedLowGroup = bands[channel][0] * appliedBandGain[0]
@@ -667,6 +705,35 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
                 + highGroupPhase.processSample(channel,
                                                 compressedMid * multibandLimiterGain[1]
                                                 + compressedTop * multibandLimiterGain[2]);
+            recombined[channel] = value;
+        }
+
+        // The bus runs even at zero mix so its filters and detector are settled
+        // the moment the operator, or the music weight, brings it in.
+        const auto bodyAmount = bodyMix.getNextValue();
+        float bodySignal[maximumChannels] { 0.0f, 0.0f };
+        auto bodyPower = 0.0f;
+        for (int channel = 0; channel < activeChannels; ++channel)
+        {
+            auto shaped = recombined[channel];
+            for (auto& filter : bodyFilters)
+                shaped = filter.process(channel, shaped);
+            bodySignal[channel] = shaped;
+            bodyPower = std::max(bodyPower, shaped * shaped);
+        }
+        const auto bodyCoefficient = bodyPower > bodyEnvelopeSquare ? bodyAttack : bodyRelease;
+        bodyEnvelopeSquare = bodyCoefficient * bodyEnvelopeSquare + (1.0f - bodyCoefficient) * bodyPower;
+        const auto bodyLevelDb = gainToDecibels(std::sqrt(bodyEnvelopeSquare));
+        const auto bodyOver = std::max(0.0f, bodyLevelDb - bodyThresholdDb);
+        const auto bodyUnder = std::max(0.0f, bodyFloorDb - bodyLevelDb);
+        const auto bodyTargetGain = decibelsToGain(-std::min(bodyOver - bodyOver / bodyRatio
+                                                                 + bodyUnder * bodyExpansionRatio,
+                                                             bodyMaximumReductionDb));
+        bodyGain = (bodyTargetGain < bodyGain ? gainAttack : gainRelease) * (bodyGain - bodyTargetGain) + bodyTargetGain;
+        blockMaxBodyMix = std::max(blockMaxBodyMix, bodyAmount);
+        for (int channel = 0; channel < activeChannels; ++channel)
+        {
+            const auto value = recombined[channel] + bodySignal[channel] * bodyGain * bodyAmount;
             preSaturationBuffer.setSample(channel, sampleIndex, value * blockOutputGain);
         }
     }
@@ -912,6 +979,7 @@ void ProcessingEngine::process(float* const* channels, int numChannels, int numS
     metrics.deEsserReductionDb.store(blockMaxDeEsser, std::memory_order_release);
     metrics.dynamicEqReductionDb.store(blockMaxDynamicEq, std::memory_order_release);
     metrics.compressorMakeupDb.store(gainToDecibels(blockMaxMakeup, 0.0f), std::memory_order_release);
+    metrics.bodyMix.store(blockMaxBodyMix / bodyMaximumMix, std::memory_order_release);
     metrics.broadcastLevelGainDb.store(gainToDecibels(inputLevelGain * outputLevelGain), std::memory_order_release);
     metrics.abMatchGainDb.store(gainToDecibels(dryMatchGain.getCurrentValue(), -24.0f), std::memory_order_release);
     metrics.failsafeActive.store(failsafeBlend > 0.0f, std::memory_order_release);

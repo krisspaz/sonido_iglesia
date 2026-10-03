@@ -118,8 +118,9 @@ private:
     juce::Slider claritySlider;
     juce::Slider dynamicsSlider;
     juce::Slider warmthSlider;
+    juce::Slider bodySlider;
     juce::Slider loudnessSlider;
-    std::array<juce::Label, 6> controlLabels;
+    std::array<juce::Label, 7> controlLabels;
     juce::TextButton autoTuneButton { "AUTO TUNE" };
     juce::TextButton abButton { "A/B : B" };
     juce::TextButton bypassButton { "BYPASS" };

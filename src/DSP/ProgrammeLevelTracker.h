@@ -60,6 +60,20 @@ public:
     // Long enough to sit through a pause for prayer, short enough that a genuinely
     // quieter section is picked up while it is still the same thought.
     static constexpr double gateHoldSeconds = 2.50;
+    // A preacher starting after the worship needs no such wait: the hold is
+    // the stretch where the sermon plays at the music's gain, 10-20 dB too
+    // quiet. Speech announces itself with syllable onsets, which a reverb tail
+    // (a steady fall) and room tone (no movement) never produce, so a few of
+    // them settle the question well before the full hold.
+    static constexpr double speechHoldSeconds = 0.80;
+    static constexpr int speechOnsetCount = 3;
+    // Syllables inside a word dip only about 8 dB on the fast detector and rise
+    // over some 100 ms, so the valley may only creep up slowly or it erases
+    // them. One steep attack, like a door, still counts once: the next onset
+    // needs the level to have turned down from its peak first.
+    static constexpr float onsetRiseDb = 5.0f;
+    static constexpr float onsetRearmDb = 3.0f;
+    static constexpr float valleyRiseDbPerSecond = 20.0f;
     // How long the estimate is allowed to move quickly after a section has been
     // accepted. Long enough to cover the step, short enough that the next fall is
     // judged on its own merits.
@@ -88,6 +102,8 @@ public:
         innovationCoefficient = std::exp(-1.0f / static_cast<float>(sampleRate * kalmanInnovationSeconds));
         loudnessAverageCoefficient = std::exp(-1.0f / static_cast<float>(sampleRate * loudnessAverageSeconds));
         gateHoldSamples = static_cast<float>(sampleRate * gateHoldSeconds);
+        speechHoldSamples = static_cast<float>(sampleRate * speechHoldSeconds);
+        valleyRisePerSample = static_cast<float>(valleyRiseDbPerSecond / sampleRate);
         sectionRebaseLength = static_cast<float>(sampleRate * sectionRebaseSeconds);
         trendCoefficient = static_cast<float>(1.0 / (sampleRate * variationSeconds));
         gateLevelCoefficient = static_cast<float>(1.0 / (sampleRate * gateIntegrationSeconds));
@@ -116,6 +132,10 @@ public:
         gateLevelDb = -100.0f;
         levelTrend = -100.0f;
         variationDb = 0.0f;
+        valleyDb = -100.0f;
+        onsetPeakDb = -100.0f;
+        onsetArmed = true;
+        onsets = 0;
         gateOpen = false;
         silenceSamples = 0.0f;
     }
@@ -167,6 +187,25 @@ private:
         // is looking at is exactly what this is for.
         levelTrend += trendCoefficient * (measuredDb - levelTrend);
         variationDb += trendCoefficient * (std::abs(measuredDb - levelTrend) - variationDb);
+        if (onsetArmed)
+        {
+            valleyDb = std::min(measuredDb, valleyDb + valleyRisePerSample);
+            if (measuredDb - valleyDb > onsetRiseDb)
+            {
+                ++onsets;
+                onsetArmed = false;
+                onsetPeakDb = measuredDb;
+            }
+        }
+        else
+        {
+            onsetPeakDb = std::max(onsetPeakDb, measuredDb);
+            if (measuredDb < onsetPeakDb - onsetRearmDb)
+            {
+                onsetArmed = true;
+                valleyDb = measuredDb;
+            }
+        }
 
         // Gate first. A closed gate freezes the estimate, so a pause cannot drag
         // the programme level down and then be levelled back up as room noise
@@ -212,12 +251,15 @@ private:
                 // first few seconds -- which is precisely the span being judged.
                 levelTrend = measuredDb;
                 variationDb = 0.0f;
+                onsets = 0;
             }
             gateClosedSamples += 1.0f;
             // Duration alone cannot separate a quieter section from room tone:
             // four seconds of air conditioning outlasts any sensible hold. What
             // separates them is that speech moves and a room does not.
-            if (gateClosedSamples > gateHoldSamples && variationDb > speechVariationDb)
+            const auto heldLongEnough = gateClosedSamples > gateHoldSamples
+                || (gateClosedSamples > speechHoldSamples && onsets >= speechOnsetCount);
+            if (heldLongEnough && variationDb > speechVariationDb)
             {
                 loudnessAverage = gateLevelDb;
                 loudnessSampleCount = 1.0f;
@@ -318,6 +360,14 @@ private:
     float levelTrend = -100.0f;
     float variationDb = 0.0f;
     float trendCoefficient = 0.0f;
+    // Syllable onsets counted since the gate closed: rises of the fast
+    // detector well above its recent valley.
+    float valleyDb = -100.0f;
+    float onsetPeakDb = -100.0f;
+    float valleyRisePerSample = 0.0f;
+    bool onsetArmed = true;
+    int onsets = 0;
+    float speechHoldSamples = 0.0f;
     bool gateOpen = false;
     // A closed gate freezes the estimate, which is right for a prayer pause but
     // wrong for the end of a service: holding a large gain armed means the next

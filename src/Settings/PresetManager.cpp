@@ -53,6 +53,7 @@ juce::Result PresetManager::save(const juce::String& name, const DspParameters& 
     setNumber(*object, "clarity", p.clarity.load());
     setNumber(*object, "dynamics", p.dynamics.load());
     setNumber(*object, "warmth", p.warmth.load());
+    setNumber(*object, "body", p.body.load());
     setNumber(*object, "loudnessTarget", p.loudnessTarget.load());
     object->setProperty("rumbleEnabled", p.rumbleEnabled.load());
     object->setProperty("adaptiveEqEnabled", p.adaptiveEqEnabled.load());
@@ -82,6 +83,7 @@ juce::Result PresetManager::load(const juce::File& file, DspParameters& p) const
     p.clarity.store(readFloat(*object, "clarity", p.clarity.load(), 0.0f, 1.0f));
     p.dynamics.store(readFloat(*object, "dynamics", p.dynamics.load(), 0.0f, 1.0f));
     p.warmth.store(readFloat(*object, "warmth", p.warmth.load(), 0.0f, 1.0f));
+    p.body.store(readFloat(*object, "body", p.body.load(), 0.0f, 1.0f));
     p.loudnessTarget.store(readFloat(*object, "loudnessTarget", p.loudnessTarget.load(), -18.0f, -10.0f));
     p.rumbleEnabled.store(readBool(*object, "rumbleEnabled", p.rumbleEnabled.load()));
     p.adaptiveEqEnabled.store(readBool(*object, "adaptiveEqEnabled", p.adaptiveEqEnabled.load()));

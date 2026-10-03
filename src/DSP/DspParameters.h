@@ -29,6 +29,10 @@ struct DspParameters final
     std::atomic<float> clarity { 0.50f };
     std::atomic<float> dynamics { 0.50f };
     std::atomic<float> warmth { 0.35f };
+    // Parallel compression weighted to the low mids, for worship that sounds
+    // thin and empty. Off by default; scaled by AdaptiveTargets::musicWeight so
+    // it stands down on its own during the sermon.
+    std::atomic<float> body { 0.0f };
     std::atomic<float> loudnessTarget { -14.0f };
     // Conservative offsets set only after an operator confirms an offline
     // Church Sound Analyst recommendation. The real-time engine remains fully
@@ -102,6 +106,10 @@ struct AdaptiveTargets final
     std::atomic<float> loudnessGainDb { 0.0f };
     std::atomic<float> stereoWidth { 1.0f };
     std::atomic<float> stereoBalanceDb { 0.0f };
+    // 1 on music, 0 on speech, ramped over seconds by the Smart Engine. Stays
+    // at 1 when the Smart Engine is not running, so BODY then answers only to
+    // the operator.
+    std::atomic<float> musicWeight { 1.0f };
 };
 
 struct DspMetrics final
@@ -122,6 +130,9 @@ struct DspMetrics final
     std::array<std::atomic<float>, 5> toneMatchGainDb {};
     std::atomic<float> dynamicEqReductionDb { 0.0f };
     std::atomic<float> compressorMakeupDb { 0.0f };
+    // Share of the parallel BODY bus actually being mixed in, 0 to 1, after
+    // the music weight.
+    std::atomic<float> bodyMix { 0.0f };
     std::atomic<float> broadcastLevelGainDb { 0.0f };
     std::atomic<float> abMatchGainDb { 0.0f };
     // Inter-channel correlation of the processed programme, and the width the

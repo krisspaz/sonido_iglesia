@@ -86,7 +86,7 @@ public:
 private:
     struct ParameterCopy
     {
-        float clean = 0.5f, punch = 0.5f, clarity = 0.5f, dynamics = 0.5f, warmth = 0.35f;
+        float clean = 0.5f, punch = 0.5f, clarity = 0.5f, dynamics = 0.5f, warmth = 0.35f, body = 0.0f;
         float loudnessTarget = -14.0f;
         int operatingMode = 1;
         bool rumble = true, eq = true, compressor = true, saturation = true, limiter = true;

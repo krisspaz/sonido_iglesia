@@ -40,6 +40,7 @@ bool OfflineProcessor::startProcessing(const juce::File& source, const DspParame
     parameterCopy.clarity = parameters.clarity.load();
     parameterCopy.dynamics = parameters.dynamics.load();
     parameterCopy.warmth = parameters.warmth.load();
+    parameterCopy.body = parameters.body.load();
     parameterCopy.loudnessTarget = parameters.loudnessTarget.load();
     parameterCopy.operatingMode = parameters.operatingMode.load();
     parameterCopy.rumble = parameters.rumbleEnabled.load();
@@ -114,6 +115,7 @@ void OfflineProcessor::run()
     parameters.clarity.store(parameterCopy.clarity);
     parameters.dynamics.store(parameterCopy.dynamics);
     parameters.warmth.store(parameterCopy.warmth);
+    parameters.body.store(parameterCopy.body);
     parameters.rumbleEnabled.store(parameterCopy.rumble);
     parameters.adaptiveEqEnabled.store(parameterCopy.eq);
     parameters.compressorEnabled.store(parameterCopy.compressor);
