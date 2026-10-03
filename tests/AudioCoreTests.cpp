@@ -3136,10 +3136,19 @@ CSP_TEST_CASE void testSermonAndWorshipLandAtTheSameLoudness()
 
 CSP_TEST_CASE void testSermonIsAudibleAsSoonAsWorshipEnds()
 {
+    // A preacher 10 dB under the worship closes the leveller's relative gate,
+    // and while it is closed the sermon plays at the music's gain. The full
+    // pause hold left about three seconds of a barely audible pastor after
+    // every song; syllable onsets must settle it well before that. The same
+    // drop with no speech in it -- a reverb tail into room tone, with a door in
+    // the middle -- must still be held like a pause and not levelled up.
     constexpr double sampleRate = 48000.0;
     constexpr int blockSize = 256;
-    for (const auto sermonAmplitude : { 0.03f, 0.012f, 0.005f })
-    {
+    juce::Random random(20261002);
+    const auto roomTone = [&] { return 0.0015f * (2.0f * random.nextFloat() - 1.0f); };
+
+    const auto afterWorship = [&](double seconds, const std::function<float(int64_t)>& generate,
+                                  float& worshipGainDb, float& endGainDb) {
         auto engine = std::make_unique<churchstream::ProcessingEngine>();
         engine->prepare(sampleRate, blockSize, 2);
         configureDefaultChain(*engine);
@@ -3147,42 +3156,48 @@ CSP_TEST_CASE void testSermonIsAudibleAsSoonAsWorshipEnds()
         float* channels[] { left.data(), right.data() };
         const auto coefficient = std::exp(-1.0 / (sampleRate * 0.4));
         double outputSquare = 0.0;
+        double worshipSquare = 0.0;
+        const auto worshipBlocks = static_cast<int>(30.0 * sampleRate / blockSize);
+        const auto blocks = worshipBlocks + static_cast<int>(seconds * sampleRate / blockSize);
         int64_t index = 0;
-        const auto run = [&](double seconds, bool sermon, std::vector<float>* trace) {
-            const auto blocks = static_cast<int>(seconds * sampleRate / blockSize);
-            for (int block = 0; block < blocks; ++block)
+        for (int block = 0; block < blocks; ++block)
+        {
+            for (int sample = 0; sample < blockSize; ++sample)
             {
-                for (int sample = 0; sample < blockSize; ++sample)
-                {
-                    const auto value = sermon ? sermonSample(index, sampleRate, sermonAmplitude)
-                                              : worshipSample(index, sampleRate, 0.08f);
-                    ++index;
-                    left[static_cast<size_t>(sample)] = value;
-                    right[static_cast<size_t>(sample)] = value;
-                }
-                engine->process(channels, 2, blockSize);
-                for (int sample = 0; sample < blockSize; ++sample)
-                    outputSquare = coefficient * outputSquare
-                        + (1.0 - coefficient) * left[static_cast<size_t>(sample)] * left[static_cast<size_t>(sample)];
-                if (trace != nullptr && block < 800 && block % 19 == 0)
-                    std::cout << (engine->getMetrics().levelerGateOpen.load() ? "o" : "c");
-                if (trace != nullptr && block % 94 == 0)
-                {
-                    trace->push_back(static_cast<float>(10.0 * std::log10(outputSquare + 1.0e-20)));
-                    std::cout << "[" << engine->getMetrics().broadcastLevelGainDb.load() << (engine->getMetrics().levelerGateOpen.load() ? "o" : "c") << "]";
-                }
+                const auto value = block < worshipBlocks ? worshipSample(index, sampleRate, 0.08f)
+                                                         : generate(index - worshipBlocks * blockSize);
+                ++index;
+                left[static_cast<size_t>(sample)] = value;
+                right[static_cast<size_t>(sample)] = value;
             }
-        };
-        run(30.0, false, nullptr);
-        std::cout << "worship gain " << engine->getMetrics().broadcastLevelGainDb.load() << "\n";
-        const auto worshipDb = 10.0 * std::log10(outputSquare);
-        std::vector<float> trace;
-        run(15.0, true, &trace);
-        std::cout << "sermon " << sermonAmplitude << " worship " << worshipDb << " dB:";
-        for (const auto value : trace)
-            std::cout << ' ' << std::lround(value - worshipDb);
-        std::cout << '\n';
-    }
+            engine->process(channels, 2, blockSize);
+            for (int sample = 0; sample < blockSize; ++sample)
+                outputSquare = coefficient * outputSquare
+                    + (1.0 - coefficient) * left[static_cast<size_t>(sample)] * left[static_cast<size_t>(sample)];
+            if (block == worshipBlocks - 1)
+            {
+                worshipSquare = outputSquare;
+                worshipGainDb = engine->getMetrics().broadcastLevelGainDb.load();
+            }
+        }
+        endGainDb = engine->getMetrics().broadcastLevelGainDb.load();
+        return static_cast<float>(10.0 * std::log10(outputSquare / worshipSquare));
+    };
+
+    float worshipGainDb = 0.0f, endGainDb = 0.0f;
+    const auto sermonDb = afterWorship(2.5, [&](int64_t index) { return sermonSample(index, sampleRate, 0.03f); },
+                                       worshipGainDb, endGainDb);
+    expect(sermonDb > -3.0f, "a sermon after the worship must be levelled within 2.5 s, not held at the music's gain");
+
+    const auto tail = [&](int64_t index) {
+        const auto t = static_cast<double>(index) / sampleRate;
+        const auto decay = std::pow(10.0, -30.0 * t / 20.0);
+        const auto door = t > 1.5 && t < 1.53 ? 0.2f * (2.0f * random.nextFloat() - 1.0f) : 0.0f;
+        return static_cast<float>(decay * worshipSample(index, sampleRate, 0.08f)) + roomTone() + door;
+    };
+    afterWorship(2.4, tail, worshipGainDb, endGainDb);
+    expect(endGainDb < worshipGainDb + 3.0f,
+           "a reverb tail into room tone, even with a door in it, must be held like a pause");
 }
 
 CSP_TEST_CASE void testCompressorWorksWhateverTheConsoleSends()

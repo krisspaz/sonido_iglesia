@@ -66,7 +66,14 @@ public:
     // (a steady fall) and room tone (no movement) never produce, so a few of
     // them settle the question well before the full hold.
     static constexpr double speechHoldSeconds = 0.80;
-    static constexpr int speechOnsetCount = 3;
+    // Onsets are counted as a leaky activity, so only recent ones count: speech
+    // keeps it high, a single door or cough fades out of it in a second or two.
+    static constexpr double onsetActivitySeconds = 1.50;
+    static constexpr float speechOnsetActivity = 2.2f;
+    // Even the full hold needs recent onsets. Variation alone read a reverb tail
+    // as speech -- a steady fall leaves the level far from its lagging trend --
+    // and accepted the room tone after it as a section, levelling it up.
+    static constexpr float sectionOnsetActivity = 0.8f;
     // Syllables inside a word dip only about 8 dB on the fast detector and rise
     // over some 100 ms, so the valley may only creep up slowly or it erases
     // them. One steep attack, like a door, still counts once: the next onset
@@ -103,6 +110,7 @@ public:
         loudnessAverageCoefficient = std::exp(-1.0f / static_cast<float>(sampleRate * loudnessAverageSeconds));
         gateHoldSamples = static_cast<float>(sampleRate * gateHoldSeconds);
         speechHoldSamples = static_cast<float>(sampleRate * speechHoldSeconds);
+        onsetActivityCoefficient = std::exp(-1.0f / static_cast<float>(sampleRate * onsetActivitySeconds));
         valleyRisePerSample = static_cast<float>(valleyRiseDbPerSecond / sampleRate);
         sectionRebaseLength = static_cast<float>(sampleRate * sectionRebaseSeconds);
         trendCoefficient = static_cast<float>(1.0 / (sampleRate * variationSeconds));
@@ -135,7 +143,7 @@ public:
         valleyDb = -100.0f;
         onsetPeakDb = -100.0f;
         onsetArmed = true;
-        onsets = 0;
+        onsetActivity = 0.0f;
         gateOpen = false;
         silenceSamples = 0.0f;
     }
@@ -187,12 +195,13 @@ private:
         // is looking at is exactly what this is for.
         levelTrend += trendCoefficient * (measuredDb - levelTrend);
         variationDb += trendCoefficient * (std::abs(measuredDb - levelTrend) - variationDb);
+        onsetActivity *= onsetActivityCoefficient;
         if (onsetArmed)
         {
             valleyDb = std::min(measuredDb, valleyDb + valleyRisePerSample);
             if (measuredDb - valleyDb > onsetRiseDb)
             {
-                ++onsets;
+                onsetActivity += 1.0f;
                 onsetArmed = false;
                 onsetPeakDb = measuredDb;
             }
@@ -251,14 +260,15 @@ private:
                 // first few seconds -- which is precisely the span being judged.
                 levelTrend = measuredDb;
                 variationDb = 0.0f;
-                onsets = 0;
+                onsetActivity = 0.0f;
             }
             gateClosedSamples += 1.0f;
             // Duration alone cannot separate a quieter section from room tone:
             // four seconds of air conditioning outlasts any sensible hold. What
             // separates them is that speech moves and a room does not.
-            const auto heldLongEnough = gateClosedSamples > gateHoldSamples
-                || (gateClosedSamples > speechHoldSamples && onsets >= speechOnsetCount);
+            const auto heldLongEnough
+                = (gateClosedSamples > gateHoldSamples && onsetActivity >= sectionOnsetActivity)
+                || (gateClosedSamples > speechHoldSamples && onsetActivity >= speechOnsetActivity);
             if (heldLongEnough && variationDb > speechVariationDb)
             {
                 loudnessAverage = gateLevelDb;
@@ -360,13 +370,14 @@ private:
     float levelTrend = -100.0f;
     float variationDb = 0.0f;
     float trendCoefficient = 0.0f;
-    // Syllable onsets counted since the gate closed: rises of the fast
+    // Recent syllable onsets since the gate closed: rises of the fast
     // detector well above its recent valley.
     float valleyDb = -100.0f;
     float onsetPeakDb = -100.0f;
     float valleyRisePerSample = 0.0f;
     bool onsetArmed = true;
-    int onsets = 0;
+    float onsetActivity = 0.0f;
+    float onsetActivityCoefficient = 0.0f;
     float speechHoldSamples = 0.0f;
     bool gateOpen = false;
     // A closed gate freezes the estimate, which is right for a prayer pause but
